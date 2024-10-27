@@ -1,63 +1,49 @@
 # MetaPhlAn: Metagenomic Phylogenetic Analysis
 [![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](http://bioconda.github.io/recipes/metaphlan/README.html) [![PyPI - Downloads](https://img.shields.io/pypi/dm/metaphlan?label=MetaPhlAn%20on%20PyPi)](https://pypi.org/project/MetaPhlAn/) [![MetaPhlAn on DockerHub](https://img.shields.io/docker/pulls/biobakery/metaphlan?label=MetaPhlAn%20on%20DockerHub)](https://hub.docker.com/r/biobakery/metaphlan) [![Build MetaPhlAn package](https://github.com/biobakery/MetaPhlAn/workflows/Build%20MetaPhlAn%20package/badge.svg?branch=3.0)](https://github.com/biobakery/MetaPhlAn/actions?query=workflow%3A%22Build+MetaPhlAn+package%22)
-## What's new in version 3
-* New MetaPhlAn marker genes extracted with a newer version of ChocoPhlAn based on UniRef
-* Estimation of metagenome composed by unknown microbes with parameter `--unknown_estimation`
-* Automatic retrieval and installation of the latest MetaPhlAn database  with parameter `--index latest`
-* Virus profiling with `--add_viruses`
-* Calculation of metagenome size for improved estimation of reads mapped to a given clade
-* Inclusion of NCBI taxonomy ID in the ouput file
-* CAMI (Taxonomic) Profiling Output Format included
-* Removal of reads with low MAPQ values
+
+MetaPhlAn is a computational tool for species-level microbial profiling (bacteria, archaea, eukaryotes, and viruses) from metagenomic shotgun sequencing data. 
+StrainPhlAn (available within MetaPhlAn) allows strain-level microbial population genomics.
+
 -------------
 
-## Description
-MetaPhlAn is a computational tool for profiling the composition of microbial communities (Bacteria, Archaea and Eukaryotes) from metagenomic shotgun sequencing data (i.e. not 16S) with species-level. With the newly added StrainPhlAn module, it is now possible to perform accurate strain-level microbial profiling.
+### Installation
 
-MetaPhlAn relies on ~1.1M unique clade-specific marker genes (the latest marker information file `mpa_v30_CHOCOPhlAn_201901_marker_info.txt.bz2` can be found  [here](https://www.dropbox.com/sh/7qze7m7g9fe2xjg/AAAlyQITZuUCtBUJxpxhIroIa/mpa_v30_CHOCOPhlAn_201901_marker_info.txt.bz2?dl=1)) identified from ~100,000 reference genomes (~99,500 bacterial and archaeal and ~500 eukaryotic), allowing:
+To install MetaPhlan through conda run:
 
-* unambiguous taxonomic assignments;
-* accurate estimation of organismal relative abundance;
-* species-level resolution for bacteria, archaea, eukaryotes and viruses;
-* strain identification and tracking
-* orders of magnitude speedups compared to existing methods.
-* metagenomic strain-level population genomics
+```
+$ conda install -c bioconda metaphlan
+```
 
+For further installation instructions and alternative installation methods check the [MetaPhlAn documentation](https://github.com/biobakery/MetaPhlAn/wiki/MetaPhlAn-4#installation).
+
+-------------
+
+### Citation
 If you use MetaPhlAn, please cite:
 
-[**Integrating taxonomic, functional, and strain-level profiling of diverse microbial communities with bioBakery 3**](https://www.biorxiv.org/content/10.1101/2020.11.19.388223v1) *Francesco Beghini, Lauren J McIver, Aitor Blanco-Miguez, Leonard Dubois, Francesco Asnicar, Sagun Maharjan, Ana Mailyan, Andrew Maltez Thomas, Paolo Manghi, Mireia Valles-Colomer, George Weingart, Yancong Zhang, Moreno Zolfo, Curtis Huttenhower, Eric A Franzosa, Nicola Segata*. bioRxiv preprint (2020)
+[**Extending and improving metagenomic taxonomic profiling with uncharacterized species using MetaPhlAn 4.**](https://doi.org/10.1038/s41587-023-01688-w) Aitor Blanco-Miguez, Francesco Beghini, Fabio Cumbo, Lauren J. McIver, Kelsey N. Thompson, Moreno Zolfo, Paolo Manghi, Leonard Dubois, Kun D. Huang, Andrew Maltez Thomas, Gianmarco Piccinno, Elisa Piperni, Michal Punčochář, Mireia Valles-Colomer, Adrian Tett, Francesca Giordano, Richard Davies, Jonathan Wolf, Sarah E. Berry, Tim D. Spector, Eric A. Franzosa, Edoardo Pasolli, Francesco Asnicar, Curtis Huttenhower, Nicola Segata. Nature Biotechnology (2023)
 
-If you use StrainPhlAn, please cite the MetaPhlAn paper and the following StrainPhlAn paper:
+If you use StrainPhlAn, please cite the MetaPhlAn paper and the StrainPhlAn paper:
 
-[**Microbial strain-level population structure and genetic diversity from metagenomes.**](http://genome.cshlp.org/content/27/4/626.full.pdf) *Duy Tin Truong, Adrian Tett, Edoardo Pasolli, Curtis Huttenhower, & Nicola Segata*. Genome Research 27:626-638 (2017)
+[**Microbial strain-level population structure and genetic diversity from metagenomes.**](http://genome.cshlp.org/content/27/4/626.full.pdf) Duy Tin Truong, Adrian Tett, Edoardo Pasolli, Curtis Huttenhower, Nicola Segata. Genome Research (2017)
 
--------------
+If you use the MetaPhlAn viral module, please cite the MetaPhlAn paper and the MetaPhlan viral module paper:
 
-## Installation
-The best way to install MetaPhlAn is through conda via the Bioconda channel. If you have not configured you Anaconda installation in order to fetch packages from Bioconda, **please follow [these steps](https://bioconda.github.io/user/install.html#set-up-channels) in order to setup the channels.**
-
-You can install MetaPhlAn by running
-
-```
-$ conda install -c bioconda python=3.7 metaphlan
-```
-
-For installing it from the source code and for further installation instructions, please see the Wiki at the [Installation](https://github.com/biobakery/MetaPhlAn/wiki/MetaPhlAn-3.0#installation) paragraph.
+[**Discovering and exploring the hidden diversity of human gut viruses using highly enriched virome samples.**](https://doi.org/10.1101/2024.02.19.580813 ) Moreno Zolfo, Andrea Silverj, Aitor Blanco-Míguez, Paolo Manghi, Omar Rota-Stabelli, Vitor Heidrich, Jordan Jensen, Sagun Maharjan, Eric Franzosa, Cristina Menni, Alessia Visconti, Federica Pinto, Matteo Ciciani, Curtis Huttenhower, Anna Cereseto, Francesco Asnicar, Hiroaki Kitano, Takuji Yamada, Nicola Segata. bioRxiv (2024)
 
 -------------
 
-## MetaPhlAn and StrainPhlAn tutorials and resources
+### Tutorials and resources
 
-In addition to the information on this page, you can refer to the following additional resources.
+* [MetaPhlan webpage](http://segatalab.cibio.unitn.it/tools/metaphlan/index.html)
+* [MetaPhlAn documentation](https://github.com/biobakery/MetaPhlAn/wiki/MetaPhlAn-4)
+* [MetaPhlan tutorial](https://github.com/biobakery/biobakery/wiki/metaphlan4)
+* [MetaPhlan user support](https://forum.biobakery.org/c/microbial-community-profiling/metaphlan/)
+* [MetaPhlan change log](https://github.com/biobakery/MetaPhlAn/blob/master/CHANGELOG.md)
+* [StrainPhlAn webpage](http://segatalab.cibio.unitn.it/tools/strainphlan/index.html)
+* [StrainPhlAn documentation](http://segatalab.cibio.unitn.it/tools/strainphlan/index.html)
+* [StrainPhlan tutorial](https://github.com/biobakery/biobakery/wiki/strainphlan4)
+* [StrainPhlan user support](https://forum.biobakery.org/c/microbial-community-profiling/strainphlan/)
 
-* The [MetaPhlAn tutorial](https://github.com/biobakery/MetaPhlAn/wiki).
-
-* The [StrainPhlAn tutorial](https://github.com/biobakery/MetaPhlAn/wiki/StrainPhlAn-3.0).
-
-* The [MetaPhlAn](https://github.com/biobakery/biobakery/wiki/metaphlan3) and [StrainPhlAn](https://github.com/biobakery/biobakery/wiki/strainphlan3) wikis on bioBakery.
-
-* The [MetaPhlAn](https://forum.biobakery.org/c/Microbial-community-profiling/MetaPhlAn/) and [StrainPhlAn](https://forum.biobakery.org/c/Microbial-community-profiling/StrainPhlAn/) Discourse forum.
-
-* Related tools including [PanPhlAn](https://github.com/segatalab/panphlan) (and its [tutorial](https://github.com/segatalab/panphlan/wiki/Home)), [GraPhlAn](https://github.com/segatalab/graphlan) (and it [tutorial](https://github.com/biobakery/biobakery/wiki/graphlan)), [PhyloPhlAn 3](https://github.com/biobakery/phylophlan) (and its [tutorial](https://github.com/biobakery/biobakery/wiki/phylophlan)), [HUMAnN](https://github.com/biobakery/humann/) (and its [tutorial](https://github.com/biobakery/biobakery/wiki/humann2)).
-
-* The related [bioBakery workflows](https://github.com/biobakery/biobakery/wiki/biobakery_workflows)
+#
+MetaPhlAn and StrainPhlAn are part of the bioBakery suite. For further bioBakery tools and tutorials visit the [bioBakery wiki](https://github.com/biobakery/biobakery).

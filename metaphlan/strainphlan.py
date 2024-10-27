@@ -3,836 +3,744 @@ __author__ = ('Aitor Blanco Miguez (aitor.blancomiguez@unitn.it), '
               'Duy Tin Truong (duytin.truong@unitn.it), '
               'Francesco Asnicar (f.asnicar@unitn.it), '
               'Moreno Zolfo (moreno.zolfo@unitn.it), '
-              'Francesco Beghini (francesco.beghini@unitn.it)')
-__version__ = '3.0'
-__date__ = '1 Sep 2020'
+              'Francesco Beghini (francesco.beghini@unitn.it),'
+              'Michal Puncochar (michal.puncochar@unitn.it')
+__version__ = '4.1.1'
+__date__ = '11 Mar 2024'
 
 
-import sys
+import argparse as ap
+import io
+import os
+import re
+import tempfile
+import time
+from collections import OrderedDict
+from shutil import copyfile, rmtree
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+from Bio import SeqIO, Seq
+
 try:
     from .utils import *
 except ImportError:
     from utils import *
-if sys.version_info[0] < 3:
-    error("StrainPhlAn " + __version__ + " requires Python 3, your current Python version is {}.{}.{}"
-                    .format(sys.version_info[0], sys.version_info[1], 
-                        sys.version_info[2]), exit=True)
 
-import os, pickle, time, bz2, numpy, collections, tempfile
-import argparse as ap
-from shutil import copyfile, rmtree, move
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
-from Bio.Seq import Seq
 
-DEFAULT_DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
-    "metaphlan_databases/mpa_v30_CHOCOPhlAn_201901.pkl")
-PHYLOPHLAN_MODES = ['accurate', 'fast']
+class Strainphlan:
 
-# Regular expression to remove comments: \n\"\"\"[^"]+\n\"\"\"
+    @staticmethod
+    def sample_path_to_name(sample_path):
+        if sample_path.endswith('.bz2'):
+            sample_path = sample_path[:-len('.bz2')]
 
-"""
-Reads and parses the command line arguments of the script.
+        sample_file = os.path.basename(sample_path)
+        name, ext = os.path.splitext(sample_file)  # ext can be pkl, json, fna, ...
+        return name
 
-:returns: the parsed arguments
-"""
+
+    def get_markers_matrix_from_samples(self):
+        """Gets a binary matrix representing the presence/absence of the clade markers in the uploaded samples
+
+        Returns:
+            list: the list containing the samples-to-markers information
+        """
+
+        return execute_pool(((Strainphlan.get_matrix_for_sample, sample_path, self.clade_markers_names,
+                              self.breadth_thres) for sample_path in self.samples), self.nprocs)
+
+
+    @classmethod
+    def get_matrix_for_sample(cls, sample_path, clade_markers, breadth_thres):
+        """Returns the matrix with the presence / absence of the clade markers in a samples
+
+        Args:
+            sample_path (str): the path to the sample
+            clade_markers (Iterable): the list with the clade markers names
+            breadth_thres:
+
+        Returns:
+            dict: dictionary containing the sample-to-markers information as a binary matrix
+        """
+        sample = ConsensusMarkers.from_file(sample_path)
+        sample_name = cls.sample_path_to_name(sample_path)
+
+        markers = {"sample_name": sample_name}
+        markers.update({m: 0 for m in clade_markers})
+        markers.update({marker.name: 1 for marker in sample.consensus_markers
+                        if marker.name in clade_markers and marker.breadth >= breadth_thres})
+        return markers
+
+
+    def filter_markers_matrix(self, markers_matrix, messages=True):
+        """Filters the primary samples, references and markers based on the user defined thresholds
+
+        Args:
+            markers_matrix (pd.DataFrame): The presence-absence data frame with index as samples and columns as markers
+            messages (bool): Whether to be verbose and halt execution when less than 4 samples are left.
+             Defaults to True.
+        """
+
+        # Step I: samples with not enough markers are treated as secondary
+        #   here the percentage is calculated from the number of markers in at least one sample, it can be less than
+        #   the total number of available markers in the database for the clade
+        n_samples_0, n_markers_0 = markers_matrix.shape
+        min_markers = max(self.sample_with_n_markers, n_markers_0 * self.sample_with_n_markers_perc / 100)
+        mm_primary = markers_matrix.loc[markers_matrix.sum(axis=1) >= min_markers]
+
+        # Step II: filter markers in not enough primary samples
+        n_samples_primary, _ = mm_primary.shape
+        min_samples = n_samples_primary * self.marker_in_n_samples_perc / 100
+        markers_matrix = markers_matrix.loc[:, mm_primary.sum(axis=0) >= min_samples]
+
+        # Step III: filter samples with not enough markers
+        #   here the percentage is calculated from the remaining markers
+        _, n_markers_2 = markers_matrix.shape
+        min_markers = max(self.sample_with_n_markers_after_filt,
+                          n_markers_2 * self.sample_with_n_markers_after_filt_perc / 100)
+        markers_matrix = markers_matrix.loc[markers_matrix.sum(axis=1) >= min_markers]
+
+        n_samples_3 = len(markers_matrix)
+        if n_samples_3 < 4:
+            if messages:
+                error(f"Phylogeny can not be inferred. Less than 4 samples remained after filtering.\n"
+                      f"{n_samples_3} / {n_samples_0} samples ({n_samples_primary} primary) "
+                      f"and {n_markers_2} / {n_markers_0 } markers remained.",
+                      exit=True)
+            return markers_matrix
+
+        return markers_matrix
+
+
+    def copy_filtered_references(self, markers_tmp_dir, filtered_sample_names):
+        """Copies the FASTA files of the filtered references to be processed by PhyloPhlAn
+
+        Args:
+            markers_tmp_dir (str): the temporary folder where to copy the reference genomes
+            filtered_sample_names (set): the set of samples after filtering
+        """
+        for reference in self.references:
+            reference_name = self.sample_path_to_name(reference)
+
+            if reference_name in filtered_sample_names:
+                reference_marker = os.path.join(self.tmp_dir, "reference_markers", f'{reference_name}.fna.bz2')
+                copyfile(reference_marker, os.path.join(markers_tmp_dir, f"{reference_name}.fna.bz2"))
+
+
+    def matrix_markers_to_fasta(self, markers_matrix):
+        """For each sample, writes the FASTA files with the sequences of the filtered markers
+
+        Args:
+            markers_matrix (pd.DataFrame):
+
+        Returns:
+            str: the temporary folder where the FASTA files were written
+        """
+        markers_tmp_dir = os.path.join(self.tmp_dir, "{}.StrainPhlAn4".format(self.clade))
+        create_folder(markers_tmp_dir)
+        filtered_sample_names = set(markers_matrix.index)
+        filtered_markers = set(markers_matrix.columns)
+        self.copy_filtered_references(markers_tmp_dir, filtered_sample_names)
+        filtered_sample_paths = [sample_path for sample_path in self.samples
+                                 if Strainphlan.sample_path_to_name(sample_path) in filtered_sample_names]
+        execute_pool(((Strainphlan.sample_markers_to_fasta, sample_path, filtered_markers, self.trim_sequences,
+                       markers_tmp_dir) for sample_path in filtered_sample_paths), self.nprocs)
+        return markers_tmp_dir
+
+
+    @classmethod
+    def sample_markers_to_fasta(cls, sample_path, filtered_markers, trim_sequences, markers_tmp_dir):
+        """Writes a FASTA file with the filtered clade markers of a sample
+
+        Args:
+            sample_path (str): the path to the sample
+            filtered_markers:
+            trim_sequences:
+            markers_tmp_dir (str): the temporary folder were the FASTA file is written
+        """
+        sample_name = cls.sample_path_to_name(sample_path)
+        marker_output_file = os.path.join(markers_tmp_dir, f'{sample_name}.fna.bz2')
+        sample = ConsensusMarkers.from_file(sample_path)
+        sample.consensus_markers = [m for m in sample.consensus_markers if m.name in filtered_markers]
+        sample.to_fasta(marker_output_file, trim_ends=trim_sequences)
+
+
+    def get_markers_from_references(self):
+        """Gets markers from reference files and returns the marker matrix with the reference markers
+
+        Args:
+
+        Returns:
+            list: the list with the samples-to-markers information of the main samples and references
+        """
+        if not self.clade_markers_file:
+            self.database_controller.extract_markers([self.clade], self.tmp_dir)
+            clade_markers_file = os.path.join(self.tmp_dir, "{}.fna".format(self.clade))
+        elif self.clade_markers_file.endswith(".bz2"):
+            clade_markers_file = decompress_bz2(self.clade_markers_file, self.tmp_dir)
+        else:
+            clade_markers_file = self.clade_markers_file
+
+        return execute_pool(((Strainphlan.process_reference, reference, self.tmp_dir, clade_markers_file,
+                              self.clade_markers_names, self.trim_sequences)
+                             for reference in self.references), self.nprocs)
+
+
+    @classmethod
+    def process_reference(cls, reference_path, tmp_dir, clade_markers_file, clade_markers, trim_sequences):
+        """Processes each reference file and get a markers dictionary to add to the markers matrix
+
+        Args:
+            reference_path (str): path to the reference file
+            tmp_dir (str): the temporary folder where the BLASTn results where saved
+            clade_markers_file (str):
+            clade_markers (Iterable): the list with the clade markers names
+            trim_sequences:
+
+        Returns:
+            dict: the dictionary with the reference-to-markers information
+        """
+        if reference_path.endswith(".bz2"):
+            uncompressed_refernces_dir = os.path.join(tmp_dir, "uncompressed_references")
+            os.makedirs(uncompressed_refernces_dir, exist_ok=True)
+            reference_path = decompress_bz2(reference_path, uncompressed_refernces_dir)
+
+        ext_markers = cls.extract_markers_from_genome(reference_path, clade_markers_file)
+
+        reference_markers_dir = os.path.join(tmp_dir, "reference_markers")
+        os.makedirs(reference_markers_dir, exist_ok=True)
+
+        consensus_markers = ConsensusMarkers([ConsensusMarker(m, s) for m, s in ext_markers.items()])
+        reference_name = cls.sample_path_to_name(reference_path)
+        consensus_markers.to_fasta(os.path.join(reference_markers_dir, f'{reference_name}.fna.bz2'),
+                                   trim_ends=trim_sequences)
+
+        markers_matrix = {'sample_name': reference_name}
+        markers_matrix.update({m: int(m in ext_markers) for m in clade_markers})
+
+        return markers_matrix
+
+
+    @staticmethod
+    def extract_with_btop(sseq, btop, qstart, qend, qlen, sstart, send):
+        btop = re.split(r'(\d+|\D{2})', btop)[1::2]  # blast trace-back operations
+
+        assert qend >= qstart  # query should be forward
+        strand = 1 if send >= sstart else -1  # whether reverse-complemented
+
+        qi = qstart - 1
+        si = sstart - 1
+        ext_s = '-' * qi
+        for op in btop:
+            if op.isnumeric():  # match
+                op = int(op)
+                b = si + strand * op
+                if b == -1 and strand == -1:  # we should go to the beginning, but -1 gets interpreted as the end
+                    b = 0
+                    ext_s += sseq[si: b: strand] + sseq[0]
+                else:
+                    ext_s += sseq[si: b: strand]
+
+                qi += op
+                si += strand * op
+            else:
+                if strand == -1:
+                    op = str(Seq.Seq(op).complement())
+
+                if op[0] == '-':  # query gap
+                    si += strand
+                elif op[1] == '-':  # subject gap
+                    ext_s += '-'
+                    qi += 1
+                else:
+                    qi += 1
+                    si += strand
+                    ext_s += op[1]
+
+        ext_s += '-' * (qlen - qend)
+
+        # Check we parsed everything correctly
+        assert qi == qend
+        assert si + 1 - strand == send
+        assert len(ext_s) == qlen
+
+        if strand == -1:
+            ext_s = str(Seq.Seq(ext_s).complement())
+
+        return ext_s
+
+
+    @classmethod
+    def extract_markers_from_genome(cls, reference_file, clade_markers_file):
+        """
+
+        Args:
+            reference_file (str):
+            clade_markers_file (str):
+
+        Returns:
+
+        """
+        # load the raw fasta data
+        with openrt(reference_file) as f:
+            input_file_data = f.read()
+
+        # parse the fasta
+        input_seqs = {seq.id: seq for seq in SeqIO.parse(io.StringIO(input_file_data), 'fasta')}
+
+        # we need the additional btop column
+        columns = 'qseqid sseqid pident length mismatch gapopen qstart qend qlen sstart send sstrand evalue bitscore btop'
+        blast_params = '-task megablast ' \
+                       '-word_size 28 ' \
+                       '-reward 1 -penalty -3 ' \
+                       '-gapopen 5 -gapextend 2 ' \
+                       '-perc_identity 90 -qcov_hsp_perc 10'
+        cmd = f'blastn -query {clade_markers_file} -subject - {blast_params} -num_threads {1} -outfmt "6 {columns}"'
+
+        # run blastn and pass the raw data to stdin
+        r = run_command(cmd, input=input_file_data, text=True)
+
+        # load the blast output
+        df = pd.read_csv(io.StringIO(r.stdout), sep='\t', names=columns.split(' '), dtype={'btop': str})
+        # df['qcov'] = (df['qend'] - df['qstart'] + 1) / df['qlen']
+        # df = df.query('qcov >= .1 and pident >= 90').copy()
+        df = df.sort_values('bitscore', ascending=False)
+
+        ext_ss = []
+        for idx, row in df.iterrows():
+            sseq = str(input_seqs[row['sseqid']].seq)
+            ext_s = cls.extract_with_btop(sseq, **row[['btop', 'qstart', 'qend', 'qlen', 'sstart', 'send']])
+            ext_ss.append(ext_s)
+        df['ext_s'] = ext_ss
+
+        def segments_overlap(sa, sb):
+            """Intervals are closed, i.e. s = [s0, s1]"""
+            if sa[0] > sb[1] or sb[0] > sa[1]:
+                return False
+            return True
+
+        def segments_intersection(sa, sb):
+            return max(sa[0], sb[0]), min(sa[1], sb[1])
+
+        def segment_difference(sa, sb):
+            si = segments_intersection(sa, sb)
+            if si[0] > si[1]:
+                return sa
+            return (sa[0], sb[0] - 1) if sa[0] < sb[0] else (sb[1] + 1, sa[1])
+
+        ext_markers = {}
+        for query, idx in df.groupby('qseqid').groups.items():  # for each query/marker
+            df_query = df.loc[idx]
+
+            # take the best hit and consider only that contig/reference and that strand
+            best_ref = df_query.iloc[0]['sseqid']
+            best_strand = df_query.iloc[0]['sstrand']
+            df_query = df_query.query(f'sseqid=="{best_ref}" and sstrand=="{best_strand}"')
+
+            covered_regions = []
+            ext_s = ['-'] * df_query.iloc[0]['qlen']
+            for _, row in df_query.iterrows():
+                reg = (row['qstart'], row['qend'])
+
+                # trim by already covered regions
+                for cr in covered_regions:
+                    reg = segment_difference(reg, cr)
+
+                if reg[0] > reg[1]:  # nothing left of the region
+                    continue
+
+                covered_regions.append(reg)
+
+                for i, b in enumerate(row['ext_s']):
+                    if i + 1 < reg[0] or i + 1 > reg[1]:
+                        continue
+                    assert ext_s[i] == '-'  # make sure the trimming works
+                    ext_s[i] = b
+
+                # if any(segments_overlap(reg, cr) for cr in covered_regions):
+                #     continue
+                #
+                # # non-overlaping hit => expand
+                # covered_regions.append(reg)
+                # assert all('-' in [a, b] for a, b in zip(ext_s, row['ext_s']))  # make sure they really don't overlap
+                # ext_s = [a if b == '-' else b for a, b in zip(ext_s, row['ext_s'])]
+
+            ext_markers[query] = ''.join(ext_s)
+
+        return ext_markers
+
+
+    def calculate_polymorphic_rates(self):
+        """Generates a file with the polymorphic rates of the species for each sample"""
+        rows = []
+        consensus_markers = execute_pool(((ConsensusMarkers.from_file, sample_path) for sample_path in self.samples),
+                                         nprocs=self.nprocs, return_generator=True, ordered=True)
+        for sample_path, cm in zip(self.samples, consensus_markers):
+            p_stats, p_count, m_len = [], 0, 0
+            for marker in cm.consensus_markers:
+                if marker.name in self.clade_markers_names:
+                    p_count += marker.get_polymorphisms()
+                    m_len += marker.get_sequence_length()
+                    p_stats.append(marker.get_polymorphism_perc())
+            if m_len > 0:
+                rows.append({
+                    'sample':  self.sample_path_to_name(sample_path),
+                    'percentage_of_polymorphic_sites': p_count * 100 / m_len,
+                    'avg_by_marker': np.mean(p_stats),
+                    'median_by_marker': np.median(p_stats),
+                    'std_by_marker': np.std(p_stats),
+                    'min_by_marker': np.min(p_stats),
+                    'max_by_marker': np.max(p_stats),
+                    'q25_by_marker': np.percentile(p_stats, 25),
+                    'q75_by_marker': np.percentile(p_stats, 75),
+                })
+
+        df = pd.DataFrame(rows)
+        df.to_csv(os.path.join(self.output_dir, f"{self.clade}.polymorphic"), sep='\t', index=False)
+
+
+    def write_info(self, markers_matrix):
+        """Writes the information file for the execution"""
+        with open(os.path.join(self.output_dir, "{}.info".format(self.clade)), 'w') as info_file:
+            info_file.write("Clade: {}\n".format(self.clade))
+            info_file.write("Number of samples: {}\n".format(len(self.samples)))
+            info_file.write("Number of references: {}\n".format(len(self.references)))
+            info_file.write("Number of available markers for the clade: {}\n".format(len(self.clade_markers_names)))
+            info_file.write("Filtering parameters:\n")
+            info_file.write("\tNumber of bases to remove when trimming markers: {}\n".format(self.trim_sequences))
+            info_file.write(f"\tMinimum number of markers to make a sample primary: "
+                            f"{self.sample_with_n_markers}\n")
+            info_file.write(f"\tMinimum percentage of markers to make a sample primary: "
+                            f"{self.sample_with_n_markers_perc}\n")
+            info_file.write(f"\tMinimum number of markers to keep a sample after filtering: "
+                            f"{self.sample_with_n_markers_after_filt}\n")
+            info_file.write(f"\tMinimum percentage of markers to keep a sample after filtering: "
+                            f"{self.sample_with_n_markers_after_filt_perc}\n")
+            info_file.write(f"\tMinimum percentage of samples to keep a marker: {self.marker_in_n_samples_perc}\n")
+            info_file.write("Number of markers selected after filtering: {}\n".format(len(markers_matrix.columns)))
+            n_samples = len([sample for sample in self.samples
+                             if Strainphlan.sample_path_to_name(sample) in markers_matrix.index])
+            info_file.write("Number of samples after filtering: {}\n".format(n_samples))
+            n_refs = len([reference for reference in self.references
+                          if Strainphlan.sample_path_to_name(reference) in markers_matrix.index])
+            info_file.write("Number of references after filtering: {}\n".format(n_refs))
+            info_file.write("PhyloPhlan phylogenetic precision mode: {}\n".format(self.phylophlan_mode))
+            info_file.write("Number of processes used: {}\n".format(self.nprocs))
+
+
+    def detect_clades(self):
+        """Checks the clades that can be reconstructed from the pkl files
+
+        Returns:
+            dict: dictionary containing the number of samples a clade can be reconstructed from
+        """
+        markers2clade = self.database_controller.get_markers2clade()
+        clade2markers = self.database_controller.get_clade2markers()
+        sample2markers = {}
+        clades_to_check = set()
+        all_markers = set()
+        info('Processing samples...')
+        consensus_markers = execute_pool(((ConsensusMarkers.from_file, sample_path) for sample_path in self.samples),
+                                         nprocs=self.nprocs, return_generator=True, ordered=True)
+        for sample_path, cm in zip(self.samples, consensus_markers):
+            sample_markers = [marker.name for marker in cm.consensus_markers
+                              if marker.name in markers2clade and marker.breadth >= self.breadth_thres]
+            sample2markers[sample_path] = sample_markers
+            all_markers.update(sample_markers)
+            clades_to_check.update((markers2clade[m] for m in sample_markers))
+
+        info('Constructing the big marker matrix')
+        all_samples = list(sample2markers.keys())
+        all_markers = list(all_markers)
+        markers_matrix_big = np.zeros(shape=(len(all_samples), len(all_markers)), dtype=int)
+        for i, sample in enumerate(all_samples):
+            sample_markers = set(sample2markers[sample])
+            for j, marker in enumerate(all_markers):
+                if marker in sample_markers:
+                    markers_matrix_big[i, j] = 1
+
+        markers_matrix_big = pd.DataFrame(markers_matrix_big, index=all_samples, columns=all_markers)
+
+        info(f'Checking {len(clades_to_check)} species')
+        species2samples = {}
+        for clade in clades_to_check:
+            markers_for_clade = markers_matrix_big.columns.intersection(clade2markers[clade])
+            markers_matrix = markers_matrix_big.loc[:, markers_for_clade]
+            markers_matrix_filtered = self.filter_markers_matrix(markers_matrix, messages=False)
+            if len(markers_matrix_filtered) >= 4:
+                species2samples[clade] = markers_matrix_filtered.index
+        info('Done.')
+        return species2samples
+
+
+    def print_clades(self):
+        """Prints the clades detected in the reconstructed markers"""
+        species2samples = self.detect_clades()
+        info(f'Detected {len(species2samples)} clades: ')
+        with open(os.path.join(self.output_dir, 'print_clades_only.tsv'), 'w') as f:
+            f.write('Clade\tNumber_of_samples\tSamples\n')
+            for species, samples in sorted(species2samples.items(), key=lambda kv: len(kv[1]), reverse=True):
+                info('\t{}: in {} samples.'.format(species, len(samples)))
+                f.write('{}\t{}\t{}\n'.format(species, len(samples),
+                                              ','.join(map(Strainphlan.sample_path_to_name, samples))))
+        info('Done.')
+
+
+    def interactive_clade_selection(self):
+        """Allows the user to interactively select the SGB-level clade when specifying the clade at the species level"""
+        if not self.non_interactive:
+            info("The clade has been specified at the species level, starting interactive clade selection...")
+        species2sgbs = self.database_controller.get_species2sgbs()
+        if self.clade not in species2sgbs:
+            error('The specified species "{}" is not present in the database. Exiting...'.format(self.clade), exit=True)
+        sgbs_in_species = dict(sorted(
+            species2sgbs[self.clade].items(), key=lambda item: item[1], reverse=True))
+        if self.non_interactive or len(sgbs_in_species) == 1:
+            selected_clade = next(iter(sgbs_in_species))
+            if len(sgbs_in_species) == 1:
+                info('Only one SGB ("{}") is available for the species "{}".'.format(
+                    selected_clade, self.clade))
+            info('Clade "{}" has been automatically selected.'.format(selected_clade))
+            info("Done.")
+            self.clade = selected_clade
+            return
+        info('Available SGBs for species "{}":'.format(self.clade))
+        option_counter = 1
+        for sgb in sgbs_in_species:
+            info('[{}] {} ({} genomes)'.format(
+                option_counter, sgb, sgbs_in_species[sgb]))
+            option_counter += 1
+        info('[{}] Exit'.format(option_counter))
+        selected_option = input('Select option: ')
+        tries = 1
+        while not selected_option.isdigit() or int(selected_option) > option_counter or int(selected_option) == 0:
+            info('"{}" is not a valid option'.format(selected_option))
+            if tries == 3:
+                error('Too many tries (3). Exiting...', exit=True)
+            tries += 1
+            selected_option = input('Select option: ')
+        selected_option = int(selected_option)
+        if selected_option == option_counter:
+            error('Exiting...', exit=True)
+        else:
+            selected_clade = list(sgbs_in_species.keys())[selected_option-1]
+            info('Clade "{}" has been selected.'.format(selected_clade))
+            info("Done.")
+            self.clade = selected_clade
+
+
+    def filter_markers_samples(self):
+        """Retrieves the filtered markers matrix with the filtered samples and references
+
+        """
+        info("Getting markers from samples...")
+        markers_matrix = self.get_markers_matrix_from_samples()
+        info("Done.")
+        if len(self.references) > 0:
+            info("Getting markers from references...")
+            markers_matrix += self.get_markers_from_references()
+            info("Done.")
+        info("Removing markers / samples...")
+        # df with index samples and columns markers
+        markers_matrix = pd.DataFrame.from_records(markers_matrix, index='sample_name')
+        markers_matrix_filtered = self.filter_markers_matrix(markers_matrix, messages=True)
+        info("Done.")
+
+        return markers_matrix_filtered
+
+
+    def run_strainphlan(self):
+        """Runs the full StrainPhlAn pipeline"""
+        if self.print_clades_only:
+            self.print_clades()
+            return
+
+        if self.clade.startswith('s__') and 'CHOCOPhlAnSGB' in self.database_controller.get_database_name():
+            self.interactive_clade_selection()
+        self.clade_markers_names = self.database_controller.get_markers_for_clade(self.clade)
+        info("Creating temporary directory...")
+        self.tmp_dir = tempfile.mkdtemp(dir=self.tmp_dir)
+        info("Done.")
+        info("Filtering markers and samples...")
+        markers_matrix = self.filter_markers_samples()
+        info("Done.")
+        info("Writing samples as markers' FASTA files...")
+        samples_as_markers_dir = self.matrix_markers_to_fasta(markers_matrix)
+        info("Done.")
+        info("Calculating polymorphic rates...")
+        self.calculate_polymorphic_rates()
+        info("Done.")
+        info("Computing phylogeny...")
+        self.phylophlan_controller.compute_phylogeny(samples_as_markers_dir, len(markers_matrix), self.tmp_dir)
+        info("Done.")
+        info("Writing information file...")
+        self.write_info(markers_matrix)
+        info("Done.")
+        if not self.debug:
+            info("Removing temporary files...")
+            rmtree(self.tmp_dir, ignore_errors=False, onerror=None)
+            info("Done.")
+
+
+    @staticmethod
+    def get_input_samples(args_samples):
+        samples = []
+        for s in args_samples:
+            if os.path.isfile(s):
+                samples.append(s)
+            elif os.path.isdir(s):
+                dir_files = [os.path.join(s, f) for f in os.listdir(s)]
+                samples.extend([f for f in dir_files if os.path.isfile(f)])
+            elif not os.path.exists(s):
+                error(f'Sample file/folder {s} does not exist', exit=True)
+            else:
+                error(f'Neither file nor directory: {s}', exit=True)
+
+        return samples
+
+
+    def __init__(self, args):
+        self.clade_markers_names = None
+        self.database_controller = MetaphlanDatabaseController(args.database)
+        self.clade_markers_file = args.clade_markers
+        self.samples = Strainphlan.get_input_samples(args.samples)
+        self.references = Strainphlan.get_input_samples(args.references)
+        self.clade = args.clade
+        self.output_dir = args.output_dir
+        self.trim_sequences = args.trim_sequences
+        self.sample_with_n_markers = args.sample_with_n_markers
+        self.sample_with_n_markers_perc = args.sample_with_n_markers_perc
+        self.marker_in_n_samples_perc = args.marker_in_n_samples_perc
+        self.sample_with_n_markers_after_filt = args.sample_with_n_markers_after_filt
+        self.sample_with_n_markers_after_filt_perc = args.sample_with_n_markers_after_filt_perc
+        self.breadth_thres = args.breadth_thres
+        self.print_clades_only = args.print_clades_only
+        self.non_interactive = args.non_interactive
+        self.phylophlan_mode = args.phylophlan_mode
+        self.phylophlan_params = args.phylophlan_params
+        self.debug = args.debug
+        self.nprocs = args.nprocs
+        self.tmp_dir = args.output_dir if args.tmp is None else args.tmp
+        self.phylophlan_controller = Phylophlan3Controller(args)
+
+
 def read_params():
+    """
+    Reads and parses the command line arguments of the script
+    
+    Returns:
+        namespace: The populated namespace with the command line arguments
+    """
     p = ap.ArgumentParser(description="", formatter_class=ap.ArgumentDefaultsHelpFormatter)
-    p.add_argument('-d', '--database', type=str, default=DEFAULT_DATABASE,
-                   help="The input MetaPhlAn " + __version__ + " database")
+    p.add_argument('-d', '--database', type=str, default='latest',
+                   help="The input MetaPhlAn {} database".format(__version__))
     p.add_argument('-m', '--clade_markers', type=str, default=None,
                    help="The clade markers as FASTA file")
-    p.add_argument('-s', '--samples', type=str, 
-                   nargs='+', default=[],
+    p.add_argument('-s', '--samples', type=str, nargs='+',
                    help="The reconstructed markers for each sample")
-    p.add_argument('-r', '--references', type=str, 
-                   nargs='+', default=[],
+    p.add_argument('-r', '--references', type=str, nargs='+', default=[],
                    help="The reference genomes")
     p.add_argument('-c', '--clade', type=str, default=None,
                    help="The clade to investigate")
-    p.add_argument('-o', '--output_dir', type=str, default=None,
+    p.add_argument('-o', '--output_dir', type=str, required=True,
                    help="The output directory")
     p.add_argument('-n', '--nprocs', type=int, default=1,
                    help="The number of threads to use")
-    p.add_argument('--secondary_samples', type=str, 
-                    nargs='+', default=[],
-                    help="The reconstructed markers for each secondary sample")
-    p.add_argument('--secondary_references', type=str, 
-                    nargs='+', default=[],
-                    help="The secondary reference genomes")
     p.add_argument('--trim_sequences', type=int, default=50,
-                    help="The number of bases to remove from both ends when trimming markers")
-    p.add_argument('--marker_in_n_samples', type=int, default=80,
-                    help="Theshold defining the minimum percentage of samples to keep a marker")
+                   help="The number of bases to remove from both ends when trimming markers")
     p.add_argument('--sample_with_n_markers', type=int, default=20,
-                    help="Threshold defining the minimun number of markers to keep a sample")
-    p.add_argument('--secondary_sample_with_n_markers', type=int, default=20,
-                    help="Threshold defining the minimun number of markers to keep a secondary sample")
-    p.add_argument('--phylophlan_mode', choices=PHYLOPHLAN_MODES, default='accurate',
-                    help="The presets for fast or accurate phylogenetic analysis")
+                   help="Threshold defining the minimum absolute number of markers for a sample to be primary. "
+                        "This rule is combined with AND logic with --sample_with_n_markers_perc")
+    p.add_argument('--sample_with_n_markers_perc', type=float, default=25,
+                   help="Threshold defining the minimum percentage of markers to for a sample to be primary. "
+                        "This rule is combined with AND logic with --sample_with_n_markers")
+    p.add_argument('--marker_in_n_samples_perc', type=float, default=50,
+                   help="Threshold defining the minimum percentage of primary samples to keep a marker")
+    p.add_argument('--sample_with_n_markers_after_filt', type=int, default=20,
+                   help="Threshold defining the minimum absolute number of markers after filtering to keep a sample. "
+                        "This rule is combined with AND logic with --sample_with_n_markers_after_filt_perc")
+    p.add_argument('--sample_with_n_markers_after_filt_perc', type=float, default=25,
+                   help="Threshold defining the minimum percentage of markers kept after filtering to keep a sample. "
+                        "This rule is combined with AND logic with --sample_with_n_markers_after_filt")
+    p.add_argument('--breadth_thres', type=int, default=80,
+                   help="Threshold defining the minimum breadth of coverage for the markers")
+    p.add_argument('--phylophlan_mode', choices=['accurate', 'fast'], default='fast',
+                   help="The presets for fast or accurate phylogenetic analysis")
     p.add_argument('--phylophlan_configuration', type=str, default=None,
-                    help="The PhyloPhlAn configuration file")
+                   help="The PhyloPhlAn configuration file")
+    p.add_argument('--tmp', type=str, default=None,
+                   help="If specified, the directory where to store the temporary files.")
     p.add_argument('--mutation_rates', action='store_true', default=False,
-                   help=("If specified will produced a mutation rates table for each of the aligned markers and a summary table "
-                         "for the concatenated MSA. This operation can take long time to finish"))
+                   help="If specified, StrainPhlAn will produce a mutation rates table for each of the aligned markers"
+                        " and a summary table for the concatenated MSA. This operation can take long time to finish")
+    p.add_argument('--phylophlan_params', type=str, default=None, help="Additional phylophlan parameters")
     p.add_argument('--print_clades_only', action='store_true', default=False,
-                   help=("If specified only print the potential clades and stop without building any tree"))
-    
+                   help="If specified, StrainPhlAn will only print the potential clades and stop the execution")
+    p.add_argument('--non_interactive', action='store_true', default=False,
+                   help="If specified, StrainPhlAn will select the first SGB available when the clade is specified at"
+                        " the species level")
+    p.add_argument('--treeshrink', action='store_true', default=False,
+                   help="If specified, StrainPhlAn will execute TreeShrink after building the tree")
+    p.add_argument('--debug', action='store_true', default=False,
+                   help="If specified, StrainPhlAn will not remove the temporary folders")
+    p.add_argument('-v', '--version', action='store_true',
+                   help="Shows this help message and exit")
+
     return p.parse_args()
 
 
-"""
-Checks the mandatory command line arguments of the script.
-
-:param args: the arguments of the script
-:returns: the checked args
-"""
 def check_params(args):
+    """Checks the mandatory command line arguments of the script
+
+    Args:
+        args (namespace): the arguments to check
+    """
     if args.print_clades_only and args.clade_markers:
-        error('-m (or --clade_markers) cannot be specified together with --print_clades_only', 
-            exit=True, init_new_line=True)
-    elif not args.samples:
-        error('-s (or --samples) must be specified', exit=True, 
-            init_new_line=True)
+        error('-m (or --clade_markers) cannot be specified together with --print_clades_only', exit=True)
     elif not args.print_clades_only and not args.clade:
-        error('-c (or --clade) must be specified', exit=True, 
-            init_new_line=True)
-    elif not args.print_clades_only and not args.output_dir:
-        error('-o (or --output_dir) must be specified', exit=True, 
-            init_new_line=True)
-    elif args.database and not os.path.exists(args.database):
-        error('The database does not exist', exit=True, 
-            init_new_line=True)
+        error('-c (or --clade) must be specified', exit=True)
+    elif not os.path.exists(args.output_dir):
+        error('The directory {} does not exist'.format(args.output_dir), exit=True)
+    elif args.tmp is not None and not os.path.exists(args.tmp):
+        error('The directory {} does not exist'.format(args.tmp), exit=True)
+    elif args.database != 'latest' and not os.path.exists(args.database):
+        error('The database does not exist', exit=True)
     elif args.clade_markers and not os.path.exists(args.clade_markers):
-        error('The clade markers file does not exist', exit=True, 
-            init_new_line=True)
+        error('The clade markers file does not exist', exit=True)
     elif args.phylophlan_configuration and not os.path.exists(args.phylophlan_configuration):
-        error('The phylophlan configuration file does not exist', exit=True, 
-            init_new_line=True)
+        error('The phylophlan configuration file does not exist', exit=True)
+    elif len(args.samples)+len(args.references) < 4:
+        error('The main inputs samples + references are less than 4', exit=True)
     for s in args.samples:
         if not os.path.exists(s):
-            error('The input sample file \"'+s+'\" does not exist', exit=True, 
-                init_new_line=True)
-    for s in args.references:
-        if not os.path.exists(s):
-            error('The reference file \"'+s+'\" does not exist', exit=True, 
-                init_new_line=True)
-    for s in args.secondary_samples:
-        if not os.path.exists(s):
-            error('The secondary input sample file \"'+s+'\" does not exist', exit=True, 
-                init_new_line=True)
-    for s in args.secondary_references:
-        if not os.path.exists(s):
-            error('The secondary reference file \"'+s+'\" does not exist', exit=True, 
-                init_new_line=True)
-    if len(args.samples)+len(args.references) < 4:
-        error('The main inputs samples + references are less than 4', exit=True, 
-            init_new_line=True)
-    if not args.print_clades_only and not args.output_dir.endswith('/'):
-        args.output_dir += '/'
+            error('The input sample file \"{}\" does not exist'.format(s), exit=True)
+    for r in args.references:
+        if not os.path.exists(r):
+            error('The reference file \"{}\" does not exist'.format(r), exit=True)
 
-    return args
+    sample_names = [Strainphlan.sample_path_to_name(s) for s in args.samples]
+    ref_names = [Strainphlan.sample_path_to_name(s) for s in args.references]
+    if len(sample_names) + len(ref_names) != len(set(sample_names + ref_names)):
+        error('Some sample or reference names are duplicated', exit=True)
 
 
-"""
-Gets a binary matrix representing the presence/ausence of the clade 
-markers in the uploaded samples
-
-:param database: the MetaPhlan2 markers database
-:param clade_markers_file: a FASTA containing the markers of a specific clade
-:param samples: the folder containing the markers generated with script samples_to_markers.py
-:param clade: the clade to investigate
-:param tmp_dir: the temporal output directory
-:param nprocs: the threads used for execution
-:returns: the clade markers FASTA file and the markers matrix
-"""
-def get_markers_matrix(database, clade_markers_file, samples, clade, tmp_dir, nprocs):
-    if not clade_markers_file:
-        clade_markers_file = extract_markers(database, clade, tmp_dir)
-    else:
-        n, _ = os.path.splitext(os.path.basename(clade_markers_file))
-        copyfile(clade_markers_file, tmp_dir+n+".fna")
-        clade_markers_file = tmp_dir+n+".fna"
-
-    clade_markers = []
-    for rec in SeqIO.parse(open(clade_markers_file, 'r'), 'fasta'):
-        clade_markers.append(rec.id)
-    
-    markers_matrix = execute_pool(((get_matrix_for_sample, s, clade_markers) for s in samples), 
-        nprocs)
-
-    return markers_matrix, clade_markers_file
-
-
-"""
-Adds secondary samples to the marker matrix
-
-:param secondary_samples: the paths to the secondary samples
-:param cleaned_markers_matrix: the markers matrix of the main samples and references
-:param secondary_samples_with_n_markers: threshold defining the minimun number of markers to keep 
-    a secondary sample
-:param nprocs: number of threads to use
-:returns: the filtered markers matrix with the secondary samples
-"""
-def add_secondary_samples(secondary_samples, cleaned_markers_matrix, 
-    secondary_samples_with_n_markers, nprocs):
-    clade_markers = list(cleaned_markers_matrix[0].keys())[1:]
-    markers_matrix = execute_pool(((get_matrix_for_sample, s, clade_markers) for s in secondary_samples), 
-        nprocs)
-    for m in markers_matrix:
-        if sum(list(m.values())[1:]) >= secondary_samples_with_n_markers:
-            cleaned_markers_matrix.append(m)  
-
-    return cleaned_markers_matrix
-
-    
-"""
-Adds secondary references to the marker matrix
-
-:param secondary_references: the paths to the secondary references
-:param cleaned_markers_matrix: the markers matrix of the main samples and references
-:param secondary_samples_with_n_markers: threshold defining the minimun number of markers to keep 
-    a secondary reference
-:param clade_markers_file: a FASTA containing the markers of a specific clade
-:param tmp_dir: the temporal output directory
-:param nprocs: the number of threads to use
-:returns: the filtered markers matrix with the secondary references
-"""
-def add_secondary_references(secondary_references, cleaned_markers_matrix, 
-    secondary_samples_with_n_markers, clade_markers_file, tmp_dir, nprocs):
-    clade_markers = list(cleaned_markers_matrix[0])[1:]
-    markers_matrix = execute_pool(((process_reference, s, tmp_dir+"blastn/", 
-        clade_markers_file, clade_markers) for s in secondary_references), 
-        nprocs)
-    for m in markers_matrix:
-        if sum(list(m.values())[1:]) >= secondary_samples_with_n_markers:
-            cleaned_markers_matrix.append(m)    
-
-    return cleaned_markers_matrix 
-
-
-"""
-Adds secondary samples and references to the marker matrix
-
-:param secondary_samples: the paths to the secondary samples
-:param secondary_references: the paths to the secondary references
-:param cleaned_markers_matrix: the markers matrix of the main samples and references
-:param secondary_samples_with_n_markers: threshold defining the minimun number 
-    of markers to keep a secondary reference
-:param clade_markers_file: a FASTA containing the markers of a specific clade
-:param tmp_dir: the temporal output directory
-:param nprocs: the number of threads to use
-:returns: the filtered markers matrix with the secondary samples and references
-"""
-def add_secondary_samples_and_references(secondary_samples, secondary_references, 
-    cleaned_markers_matrix, secondary_samples_with_n_markers, clade_markers_file, 
-    tmp_dir, nprocs):    
-    if len(secondary_samples) > 0:
-        info("Getting markers from secondary sample files...", init_new_line=True)
-        cleaned_markers_matrix = add_secondary_samples(secondary_samples, cleaned_markers_matrix, 
-        secondary_samples_with_n_markers, nprocs)
-        info("Done.", init_new_line=True)     
-    if len(secondary_references) > 0:
-        info("Getting markers from secondary reference files...", init_new_line=True)
-        cleaned_markers_matrix = add_secondary_references(secondary_references, cleaned_markers_matrix, 
-        secondary_samples_with_n_markers, clade_markers_file, tmp_dir, nprocs)
-        info("Done.", init_new_line=True) 
-    return cleaned_markers_matrix
-
-
-"""
-Gets a matrix with the presence / ausence of the clade markers in 
-a sample
-:param sample_path the path to the sample
-:param clade_markers: a list with the names of the clade markers
-:returns: the markers matrix for the sample
-"""
-def get_matrix_for_sample(sample_path, clade_markers):
-    if os.path.splitext(sample_path)[1] == ".bz2":
-        sample = pickle.load(bz2.BZ2File(sample_path))
-    else:
-        sample = pickle.load(open(sample_path, "rb"))
-    markers = {"sample": sample_path}
-    for m in clade_markers:
-        markers.update({m : 0})
-    for r in sample:
-        if r['marker'] in clade_markers:
-            markers.update({r['marker'] : 1})
-    return markers
-
-
-"""
-Remove bad markers and samples from the markers matrix:
-First, checks if the percentage of markers of a sample sample reaches a
-threshold, if not, removes the sample.
-Then, checks if the percentage of samples that contain a marker reaches 
-a threhold, if not, removes the marker.
-
-:param markers_matrix: the markers matrix
-:param samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a sample
-:param marker_in_n_samples: threshold defining the minimum percentage of 
-    samples to keep a marker
-:returns: the filtered markers matrix
-"""
-def clean_markers_matrix(markers_matrix, samples_with_n_markers, 
-    marker_in_n_samples, messages = True):    
-    # Checks if the percentage of markers of a sample sample reachs a threshold, 
-    # if not, removes the sample    
-    cleaned_markers_matrix = []
-    to_remove = []
-    for m in markers_matrix:
-        if sum(list(m.values())[1:]) < samples_with_n_markers:
-            to_remove.append(m)
-        else:
-            cleaned_markers_matrix.append({'sample': m['sample']})    
-    for r in to_remove:
-        markers_matrix.remove(r)
-
-    # Checks how many samples were deleted
-    if len(cleaned_markers_matrix) < 4:
-        if messages:
-            error("Phylogeny can not be inferred. Too many samples were discarded", 
-                exit=True, init_new_line=True) 
-        else:
-            return []
-
-    # Checks if the percentage of samples that contain a marker reachs a threhold,
-    # if not, removes the marker
-    markers = list(markers_matrix[0])[1:]
-    for m in markers:
-        marker_scores = []
-        for s in markers_matrix:
-            marker_scores.append(s[m])
-        if (sum(marker_scores) * 100) / len(marker_scores) >= marker_in_n_samples:            
-            counter = 0
-            for s in markers_matrix:
-                cleaned_markers_matrix[counter].update({m : s[m]})
-                counter += 1
-
-    # Checks how many markers were deleted
-    if len(list(cleaned_markers_matrix[0].values())[1:]) < samples_with_n_markers:        
-        if messages:
-            error("Phylogeny can not be inferred. Too many markers were discarded", 
-                exit=True, init_new_line=True) 
-        else:
-            return []
-
-    # Checks again if the percentage of markers of a sample sample is at least 1, 
-    # if not, removes the sample  
-    to_remove = []
-    for m in cleaned_markers_matrix:
-        if sum(list(m.values())[1:]) < 1:
-            to_remove.append(m)
-    for r in to_remove:
-        cleaned_markers_matrix.remove(r)
-
-    # Checks again how many samples were deleted
-    if len(cleaned_markers_matrix) < 4:        
-        if messages:
-            error("Phylogeny can not be inferred. No enough markers were kept for the samples", 
-                exit=True, init_new_line=True)
-        else:
-            return []
-
-    return cleaned_markers_matrix
-
-
-"""
-For each sample, writes the FASTA files with the sequences of the filtered markers
-
-:param cleaned_markers_matrix: a list with the filtered markers
-:param clade: the name of the clade to investigate
-:param samples: the folder containing the markers generated with script samples_to_markers.py
-:param references: the FASTA reference files
-:param trim_sequences: the number of bases to remove when trimming markers
-:param tmp_dir: the output temporal directory
-:param nprocs: the threads used for execution
-:returns: the folder of the FASTA files
-"""
-def matrix_markers_to_fasta(cleaned_markers_matrix, clade, samples, references, 
-    trim_sequences, tmp_dir, nprocs):     
-    tmp_dir=tmp_dir+clade+".StrainPhlAn3/"    
-    create_folder(tmp_dir)
-
-    filtered_samples = []
-    filtered_names = []
-    for s in cleaned_markers_matrix:
-        filtered_names.append(os.path.splitext(os.path.basename(s['sample']))[0])
-        filtered_samples.append(s['sample'])
-
-    for r in references:
-        _, f = os.path.splitext(r)
-        if f == ".bz2":
-            r = decompress_bz2(r, tmp_dir)
-        else:
-            r_name = os.path.splitext(os.path.basename(r))[0]            
-            if r_name in filtered_names:
-                copyfile(r, tmp_dir+r_name+".fna")
-
-    execute_pool(((sample_markers_to_fasta, s, filtered_samples, tmp_dir, 
-        list(cleaned_markers_matrix[0]), trim_sequences) for s in samples), 
-        nprocs)
-    return tmp_dir
-
-
-"""
-Writes a FASTA file with the filtered clade markers of a sample
-
-:param sample_path: the path to the sample
-:param filtered_samples: a list with the filtered samples
-:param tmp_dir: the temporal output directory
-:param filtered_clade_markers: a list with the filtered clade markers
-:param trim_sequences: the number of bases to remove when trimming markers
-"""
-def sample_markers_to_fasta(sample_path, filtered_samples, tmp_dir, filtered_clade_markers, trim_sequences):
-    if sample_path in filtered_samples:
-        sample_name = os.path.splitext(os.path.basename(sample_path))[0].replace(".pkl","")
-        with open(tmp_dir+sample_name+'.fna', 'w') as marker_fna:
-            if os.path.splitext(sample_path)[1] == ".bz2":
-                sample = pickle.load(bz2.BZ2File(sample_path))
-            else:
-                sample = pickle.load(open(sample_path, "rb"))
-            for r in sample:
-                if r['marker'] in filtered_clade_markers:
-                    marker_name = parse_marker_name(r['marker'])
-                    seq = SeqRecord(Seq(r['sequence'][trim_sequences:-trim_sequences].replace("*","N").replace("-","N")), id=marker_name, description=marker_name)
-                    SeqIO.write(seq, marker_fna, 'fasta')
-
-
-"""
-Writes a FASTA file with the sequences of the filtered clade markers
-
-:param markers: a list with the names of filtered markers
-:param tmp_dir: the output temporal directory
-:param clade: the threads used for execution
-:param clade_markers_file: the FASTA with the clade markers
-"""
-def cleaned_clade_markers_to_fasta(markers, tmp_dir, clade, clade_markers_file):
-    tmp_dir=tmp_dir+clade+"/"
-    create_folder(tmp_dir)
-
-    clade_markers = {}
-    for rec in SeqIO.parse(open(clade_markers_file, 'r'), 'fasta'):
-        clade_markers.update({rec.id: rec.seq})
-
-    for m in list(markers[0])[1:]:
-        marker_name = parse_marker_name(m)
-        with open(tmp_dir+marker_name+'.fna', 'w') as marker_fna:
-            seq = SeqRecord(clade_markers.get(m), id=marker_name, description=marker_name)
-            SeqIO.write(seq, marker_fna, 'fasta')
-
-
-"""
-Gets markers from reference files and returns the marker matrix with the
-reference markers
-
-:param tmp_dir: the temporal output directory
-:param clade_markers_file: the clade markers FASTA file
-:param markers_matrix: the markers matrix
-:param references: the list of the reference files
-:param nprocs: the threads using in the BLASTn executions
-:returns: the marker matrix with references
-"""
-def get_markers_from_references(tmp_dir, clade_markers_file, markers_matrix, 
-    references, nprocs): 
-    blastn_dir = tmp_dir+"blastn/"
-    create_folder(blastn_dir)
-    clade_markers = list(markers_matrix[0])[1:]
-
-    results = execute_pool(((process_reference, s, blastn_dir, 
-        clade_markers_file, clade_markers) for s in references), 
-        nprocs)
-    for r in results:
-        markers_matrix.append(r)
-        
-    return markers_matrix 
-
-
-"""
-Processes each reference file and get a markers dictionary to add 
-to the markers matrix
-
-:param r: the path to the reference file
-:param blastn_dir: the temporal blastn output directory
-:param clade_markers_file: the clade markers FASTA file
-:param markers_matrix: the markers matrix
-:returns: the markers of the reference file as a dictionary
-"""
-def process_reference(reference, blastn_dir, clade_markers_file, clade_markers):
-    n, _ = os.path.splitext(os.path.basename(reference))               
-    _, f = os.path.splitext(reference)
-    if f == ".bz2":
-        reference = decompress_bz2(reference, blastn_dir)
-    blastn_db = create_blastn_db(blastn_dir, reference)
-    blastn_file = execute_blastn(blastn_dir, clade_markers_file, blastn_db)
-    return parse_blastn_results(blastn_dir+n+'.pkl', 
-        clade_markers, blastn_file, reference)
-
-
-"""
-Parses BLASTn results and gets the presence of the clade markers in
-the reference file
-
-:param sample: the name of the reference file
-:param clade_markers: a list of the clade_markers_name
-:param blastn_file: the BLASTn output file
-:param reference: the reference FASTA file
-:returns: A dictionary with the presence of the clade markers
-"""
-def parse_blastn_results(sample, clade_markers, blastn_file, reference):
-    markers = {"sample": sample}
-    for m in clade_markers:
-        markers.update({m : 0})
-
-    reference_sequences = {}
-    for rec in SeqIO.parse(open(reference, 'r'), 'fasta'):
-        reference_sequences.update({rec.id : rec.seq})
-
-    blastn_result = open(blastn_file, "r")    
-    processed_markers = []
-    for line in blastn_result:
-        if line == '':
-            break
-        query = line.split("\t")[0]
-        if not query in processed_markers:
-            processed_markers.append(query)
-            markers.update({query : 1})   
-    blastn_result.close()
-    return markers
-
-
-"""
-Gets PhyloPhlAn configuration
-
-:param phylophlan_mode: the precision of the phylogenetic analysis
-:returns: the configuration to create a PhyloPhlAn configuration file
-"""
-def get_phylophlan_configuration():
-    configuration = dict()
-    # blastn, tblastn, diamond
-    configuration.update({'map':'blastn'})
-    # muscle, mafft, opal, upp
-    configuration.update({'aligner':'mafft'})
-    # trimal
-    configuration.update({'trim':'trimal'})
-    # fasttree, raxml, iqtree, astral, astrid
-    configuration.update({'tree1':'raxml'})
-    # configuration.update({'tree2':''})
-    
-    return configuration
-
-
-"""
-Executes PhyloPhlAn2 to compute phylogeny
-
-:param samples_markers_dir: the temporal samples markers directory
-:param num_samples: the number of filtered samples
-:param tmp_dir: the temporal output directory
-:param output_dir: the output_directory
-:param clade: the clade
-:param marker_in_n_samples: threshold defining the minimum percentage of samples to keep a marker
-:param phylophlan_mode: the precision of the phylogenetic analysis
-:param phylophlan_configuration: the PhyloPhlAn configuration file
-:param mutation_rates: whether get  the mutation rates for the markers
-:param nproc: the number of threads to run phylophlan
-"""
-def compute_phylogeny(samples_markers_dir, num_samples, tmp_dir, output_dir, clade, 
-    marker_in_n_samples, phylophlan_mode, phylophlan_configuration, mutation_rates, nprocs):    
-    info("\tCreating PhyloPhlAn 3.0 database...", init_new_line=True)
-    create_phylophlan_db(tmp_dir, clade)
-    info("\tDone.", init_new_line=True)
-    if not phylophlan_configuration:     
-        info("\tGenerating PhyloPhlAn 3.0 configuration file...", init_new_line=True)
-        conf = get_phylophlan_configuration()
-        phylophlan_configuration = generate_phylophlan_config_file(tmp_dir, conf)
-        info("\tDone.", init_new_line=True)   
-    info("\tProcessing samples...", init_new_line=True)
-    min_entries = int(marker_in_n_samples*num_samples/100)
-    execute_phylophlan(samples_markers_dir, phylophlan_configuration, min_entries,
-        tmp_dir, output_dir, clade, phylophlan_mode, mutation_rates, nprocs)
-    if mutation_rates:
-        move(output_dir+"mutation_rates.tsv",output_dir+clade+".mutation")
-        move(output_dir+"mutation_rates",output_dir+clade+"_mutation_rates")
-    info("\tDone.", init_new_line=True)
-
-
-"""
-Generates a file with the polimorfic rates of the species for each sample
-
-:param samples: the folder containing the markers to secondary samples generated with 
-    script samples_to_markers.py
-:param clade_markers_file: a FASTA containing the markers of a specific clade
-:param clade: the clade to investigate
-:param output_dir: the output directory
-"""
-def calculate_polimorfic_rates(samples, clade_markers_file, clade, output_dir):
-    clade_markers = []
-    for rec in SeqIO.parse(open(clade_markers_file, 'r'), 'fasta'):
-        clade_markers.append(rec.id)
-    with open(output_dir+clade+".polymorphic", 'w') as polimorfic_file:
-        polimorfic_file.write("sample\tpercentage_of_polymorphic_sites\tavg_by_marker\tmedian_by_marker" +
-            "\tstd_by_marker\tmin_by_marker\tmax_by_marker\tq25_by_marker\tq75_by_marker")
-        for sample_path in samples:
-            if os.path.splitext(sample_path)[1] == ".bz2":
-                sample = pickle.load(bz2.BZ2File(sample_path))
-            else:
-                sample = pickle.load(open(sample_path, "rb"))
-            p_stats, p_count, m_len = list(), 0, 0
-            for m in sample:    
-                if(m['marker'] in clade_markers):        
-                    p_count += m['sequence'].count('*')
-                    m_len += len(m['sequence'])
-                    p_stats.append(m['sequence'].count('*')*100/len(m['sequence']))
-            if not m_len == 0:
-                polimorfic_file.write("\n"+os.path.splitext(os.path.basename(sample_path))[0] +
-                    "\t"+str(p_count*100/m_len)+"\t"+str(numpy.average(p_stats)) +
-                    "\t"+str(numpy.percentile(p_stats,50)) + "\t"+str(numpy.std(p_stats)) +
-                    "\t"+str(numpy.min(p_stats)) + "\t"+str(numpy.max(p_stats)) +
-                    "\t"+str(numpy.percentile(p_stats,25)) + "\t"+str(numpy.percentile(p_stats,75)))
-    return len(clade_markers)
-
-
-"""
-Writes the information file for the execution
-
-:param cleaned_markers_matrix: a list with the filtered markers
-:param num_markers_for_clade: the number of markers in available for the clade
-:param clade: the clade to investigate
-:param output_dir: the output directory
-:param n_p_samples: the main samples
-:param n_s_samples: the secondary samples
-:param n_p_references: the main references
-:param n_s_references: the secondary references
-:param trim_sequences: the number of bases to remove when trimming markers
-:param samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a main sample
-:param marker_in_n_samples: threshold defining the minimum percentage of samples
-    to keep a marker
-:param secondary_samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a secondary sample
-:param phylophlan_mode: the precision of the phylogenetic analysis
-:param nprocs: the threads used for execution
-"""
-def write_info(cleaned_markers_matrix, num_markers_for_clade, clade, output_dir, p_samples, 
-    s_samples, p_references, s_references, trim_sequences, samples_with_n_markers, 
-    marker_in_n_samples, secondary_samples_with_n_markers, phylophlan_mode, nprocs):
-    f_p_samples, f_s_samples, f_p_references, f_s_references = 0, 0, 0, 0
-    for c in cleaned_markers_matrix:
-        if c['sample'] in p_samples:
-            f_p_samples += 1
-        elif c['sample'] in s_samples:
-            f_s_samples += 1
-        else:
-            for r in p_references:
-                if os.path.splitext(os.path.basename(c['sample']))[0] in r:
-                    f_p_references += 1
-                    break            
-            for r in s_references:
-                if os.path.splitext(os.path.basename(c['sample']))[0] in r:
-                    f_s_references += 1
-                    break
-    with open(output_dir+clade+".info", 'w') as info_file:
-        info_file.write("Clade: "+clade+"\nNumber of main samples: "+str(len(p_samples)) +
-            "\nNumber of secondary samples: " + str(len(s_samples)) +
-            "\nNumber of main references: " + str(len(p_references)) +            
-            "\nNumber of secondary references: " + str(len(s_references)) +
-            "\nNumber of available markers for the clade: " + 
-            str(num_markers_for_clade)+"\nFiltering parameters: " +
-            "\n\tNumber of bases to remove when trimming markers: "+ str(trim_sequences) +
-            "\n\tMinimun number of markers to keep a main sample: "+ str(samples_with_n_markers) +
-            "\n\tMinimun number of markers to keep a secondary sample: " + 
-            str(secondary_samples_with_n_markers) +
-            "\n\tMinimum percentage of samples to keep a marker: "+ str(marker_in_n_samples) +
-            "\nNumber of markers selected after filtering: "+str(len(cleaned_markers_matrix[0].keys())-1) +
-            "\nNumber of main samples after filtering: "+str(f_p_samples) +
-            "\nNumber of secondary samples after filtering: " + str(f_s_samples) +
-            "\nNumber of main references after filtering: " + str(f_p_references) +            
-            "\nNumber of secondary references after filtering: " + str(f_s_references) +
-            "\nPhyloPhlan phylogenetic precision mode: "+ phylophlan_mode +
-            "\nNumber of processes used: "+ str(nprocs) + "\n" )
-
-
-"""
-Prints the clades detected in the reconstructed markers
-
-:param database: the MetaPhlan2 markers database
-:param samples: the folder containing the markers to main samples generated with script 
-    samples_to_markers.py
-:param samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a main sample
-:param marker_in_n_samples: threshold defining the minimum percentage of samples
-    to keep a marker
-"""
-def print_clades(database, samples, samples_with_n_markers, marker_in_n_samples):
-    sample_id = 0
-    markers2species = dict()
-    species2markers = dict()
-    species_markers_matrix = dict()
-    species2samples = dict()
-
-    info('Loading MetaPhlan '+ __version__ + ' database...', init_new_line=True)
-    db = pickle.load(bz2.BZ2File(database))
-    for marker in db['markers']:
-        species = db['markers'][marker]['clade']
-        markers2species[marker] = species
-        if not species in species2markers:
-            species2markers[species] = list()
-        species2markers[species].append(marker)
-    info('Done.',init_new_line=True)
-
-    info('Detecting clades...', init_new_line=True)     
-    for sample_path in samples:
-        if os.path.splitext(sample_path)[1] == ".bz2":
-            sample = pickle.load(bz2.BZ2File(sample_path))
-        else:
-            sample = pickle.load(open(sample_path, "rb"))
-        for r in sample:
-            if r['marker'] in markers2species:
-                species = markers2species[r['marker']]
-                if species not in species_markers_matrix:
-                    species_markers_matrix[species] = list()
-                    for sp in samples:
-                        markers = {"sample": sp}
-                        for m in species2markers[species]:
-                            markers.update({m : 0})
-                        species_markers_matrix[species].append(markers)
-                species_markers_matrix[species][sample_id][r['marker']] = 1
-        sample_id += 1  
-    for species in species_markers_matrix:    
-        cleaned_markers_matrix = clean_markers_matrix(species_markers_matrix[species], samples_with_n_markers, marker_in_n_samples, False)
-        if len(cleaned_markers_matrix) >= 4:
-            species2samples[species] = len(cleaned_markers_matrix)
-    info('Done.',init_new_line=True)
-
-    info('Detected clades: ', init_new_line=True)
-    sorted_species2samples = collections.OrderedDict(sorted(species2samples.items(), key=lambda kv: kv[1], reverse=True))
-    for species in sorted_species2samples:
-        info('\t' + species + ': in ' + str(sorted_species2samples[species]) + ' samples.', init_new_line=True)
-    info('Done.',init_new_line=True) 
-
-
-"""
-Executes StrainPhlAn 
-
-:param database: the MetaPhlan2 markers database
-:param clade_markers: a FASTA containing the markers of a specific clade
-:param samples: the folder containing the markers to main samples generated with script 
-    samples_to_markers.py
-:param references: the reference genomes
-:param secondary_samples: the folder containing the markers to secondary samples generated with 
-    script samples_to_markers.py
-:param secondary_references: the secondary reference genomes
-:param clade: the clade to investigate
-:param output_dir: the output directory
-:param trim_sequences: the number of bases to remove when trimming markers
-:param samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a main sample
-:param marker_in_n_samples: threshold defining the minimum percentage of samples
-    to keep a marker
-:param secondary_samples_with_n_markers: threshold defining the minimun number of markers 
-    to keep a secondary sample
-:param phylophlan_mode: the precision of the phylogenetic analysis
-:param phylophlan_configuration: the PhyloPhlAn configuration file
-:param mutation_rates: whether get  the mutation rates for the markers
-:param print_clades_only: whether print only the potential clades and stop
-:param nprocs: the threads used for execution
-"""
-def strainphlan(database, clade_markers, samples, references, secondary_samples, 
-    secondary_references, clade, output_dir, trim_sequences, samples_with_n_markers, 
-    marker_in_n_samples, secondary_samples_with_n_markers, phylophlan_mode, 
-    phylophlan_configuration, mutation_rates, print_clades_only, nprocs):
-    if print_clades_only:
-        print_clades(database, samples, samples_with_n_markers, marker_in_n_samples)
-    else:
-        info("Creating temporary directory...", init_new_line=True)
-        tmp_dir = tempfile.mkdtemp(dir=output_dir) + "/"
-        info("Done.", init_new_line=True)
-        info("Getting markers from main sample files...", init_new_line=True)
-        markers_matrix, clade_markers_file = get_markers_matrix(database, clade_markers, 
-            samples, clade, tmp_dir, nprocs)
-        info("Done.", init_new_line=True)    
-        info("Getting markers from main reference files...", init_new_line=True)
-        markers_matrix = get_markers_from_references(tmp_dir, clade_markers_file, 
-            markers_matrix, references, nprocs)
-        info("Done.", init_new_line=True)    
-        info("Removing bad markers / samples...", init_new_line=True)
-        cleaned_markers_matrix = clean_markers_matrix(markers_matrix, samples_with_n_markers, 
-            marker_in_n_samples)
-        info("Done.", init_new_line=True)
-        cleaned_markers_matrix = add_secondary_samples_and_references(secondary_samples, 
-            secondary_references, cleaned_markers_matrix, secondary_samples_with_n_markers, 
-            clade_markers_file, tmp_dir, nprocs)
-        info("Writing samples as markers' FASTA files...", init_new_line=True)
-        samples_as_markers_dir = matrix_markers_to_fasta(cleaned_markers_matrix, clade,
-            samples+secondary_samples, references+secondary_references, trim_sequences, 
-            tmp_dir, nprocs)
-        info("Done.", init_new_line=True)
-        info("Writing filtered clade markers as FASTA file...", init_new_line=True)
-        cleaned_clade_markers_to_fasta(cleaned_markers_matrix, tmp_dir, clade, clade_markers_file)
-        info("Done.", init_new_line=True)
-        info("Calculating polymorphic rates...", init_new_line=True)
-        num_markers_for_clade = calculate_polimorfic_rates(samples+secondary_samples, clade_markers_file, 
-            clade, output_dir)
-        info("Done.", init_new_line=True)   
-        info("Executing PhyloPhlAn 3.0...", init_new_line=True)
-        compute_phylogeny(samples_as_markers_dir, len(cleaned_markers_matrix), tmp_dir, 
-            output_dir, clade, marker_in_n_samples, phylophlan_mode, phylophlan_configuration,
-            mutation_rates, nprocs)
-        info("Done.", init_new_line=True)     
-        info("Writing information file...", init_new_line=True)
-        write_info(cleaned_markers_matrix, num_markers_for_clade, clade, output_dir,
-            samples, secondary_samples, references, secondary_references, trim_sequences, 
-            samples_with_n_markers, marker_in_n_samples, secondary_samples_with_n_markers, 
-            phylophlan_mode, nprocs)
-        info("Done.", init_new_line=True)
-        info("Removing temporary files...", init_new_line=True)
-        rmtree(tmp_dir, ignore_errors=False, onerror=None)
-        info("Done.", init_new_line=True)
-
-
-"""
-Main function
-
-:param database: the MetaPhlan2 markers database
-:param clade_markers: a FASTA containing the markers of a specific clade
-:param samples: the folder containing the markers generated with script samples_to_markers.py
-:param references: the reference genomes
-:param secondary_samples: the folder containing the markers to secondary samples generated with 
-    script samples_to_markers.py
-:param secondary_references: the secondary reference genomes
-:param clade: the clade to investigate
-:param output_dir: the output directory
-:param trim_sequences: the number of bases to remove when trimming markers
-:param samples_with_n_markers: threshold defining the minimun number of markers to keep a main 
-    sample
-:param marker_in_n_samples: threshold defining the minimum percentage of samples to keep a marker
-:param secondary_samples_with_n_markers: threshold defining the minimun number of markers to keep 
-    a secondary sample
-:param phylophlan_mode: the precision of the phylogenetic analysis
-:param phylophlan_configuration: the PhyloPhlAn configuration file
-:param mutation_rates: whether get  the mutation rates for the markers
-:param print_clades_only: whether print only the potential clades and stop
-:param nprocs: the threads used for execution
-"""
 def main():
     t0 = time.time()
     args = read_params()
-    args = check_params(args)
-    info("Start StrainPhlAn " + __version__ + " execution")
-    strainphlan(args.database, args.clade_markers, args.samples, args.references, 
-        args.secondary_samples, args.secondary_references,  args.clade, args.output_dir, 
-        args.trim_sequences, args.sample_with_n_markers, args.marker_in_n_samples,
-        args.secondary_sample_with_n_markers, args.phylophlan_mode, args.phylophlan_configuration, 
-        args.mutation_rates, args.print_clades_only, args.nprocs)
+    if args.version:
+        info('StrainPhlAn version {} ({})'.format(__version__, __date__))
+        exit(0)
+    check_params(args)
+    info("Start StrainPhlAn {} execution".format(__version__))
+    strainphlan_runner = Strainphlan(args)
+    strainphlan_runner.run_strainphlan()
     exec_time = time.time() - t0
-    if not args.print_clades_only:
-        info("Finish StrainPhlAn " + __version__ + " execution ("+str(round(exec_time, 2))+
-            " seconds): Results are stored at \""+args.output_dir+"\"\n",
-             init_new_line=True)
-    else:
-        info("Finish StrainPhlAn " + __version__ + " execution ("+str(round(exec_time, 2))+
-            " seconds)\n", init_new_line=True)
+    info("Finish StrainPhlAn {} execution ({} seconds): Results are stored at "
+         "\"{}\"".format(__version__, round(exec_time, 2), args.output_dir))
+
 
 if __name__ == '__main__':
     main()
+    

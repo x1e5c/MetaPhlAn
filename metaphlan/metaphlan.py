@@ -1,41 +1,54 @@
 #!/usr/bin/env python
-__author__ = ('Francesco Beghini (francesco.beghini@unitn.it),'
+__author__ = ('Aitor Blanco-Miguez (aitor.blancomiguez@unitn.it), '
+              'Francesco Beghini (francesco.beghini@unitn.it), '
+              'Moreno Zolfo (moreno.zolfo@unitn.it), '
               'Nicola Segata (nicola.segata@unitn.it), '
               'Duy Tin Truong, '
-              'Francesco Asnicar (f.asnicar@unitn.it)')
-__version__ = '3.0.7'
-__date__ = '09 Dec 2020'
+              'Francesco Asnicar (f.asnicar@unitn.it), ' 
+              'Claudia Mengoni (claudia.mengoni@unitn.it)')
+__version__ = '4.1.1'
+__date__ = '11 Mar 2024'
 
 import sys
 try:
     from metaphlan import mybytes, plain_read_and_split, plain_read_and_split_line, read_and_split, read_and_split_line, check_and_install_database, remove_prefix
 except ImportError:
-    sys.exit("CRITICAL ERROR: Unable to find the MetaPhlAn python package. Please check your install.") 
+    sys.exit("CRITICAL ERROR: Unable to find the MetaPhlAn python package. Please check your install.")
 
 if float(sys.version_info[0]) < 3.0:
     sys.stderr.write("MetaPhlAn requires Python 3, your current Python version is {}.{}.{}\n"
                     .format(sys.version_info[0], sys.version_info[1], sys.version_info[2]))
     sys.exit(1)
-    
 import os
 import stat
 import re
 import time
+import random
 from collections import defaultdict as defdict
 from distutils.version import LooseVersion
 from glob import glob
 from subprocess import DEVNULL
 import argparse as ap
 import bz2
-import json
+import gzip
 import pickle
 import subprocess as subp
 import tempfile as tf
 
+from Bio.Seq import Seq
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from collections import Counter
 try:
-    import numpy as np
+    from .utils.parallelisation import execute_pool
 except ImportError:
-    sys.stderr.write("Error! numpy python library not detected!!\n")
+    from utils.parallelisation import execute_pool
+try:
+    import pandas as pd
+    import numpy as np
+    import pysam
+except Exception as e:
+    sys.stderr.write("Error! python library not detected\n{}\n".format(e))
     sys.exit(1)
 
 #**********************************************************************************************
@@ -56,16 +69,20 @@ try:
 except ImportError:
     sys.stderr.write("Warning! Biom python library not detected!"
                      "\n Exporting to biom format will not work!\n")
+import json
 
 # get the directory that contains this script
 metaphlan_script_install_folder = os.path.dirname(os.path.abspath(__file__))
 # get the default database folder
 DEFAULT_DB_FOLDER = os.path.join(metaphlan_script_install_folder, "metaphlan_databases")
+DEFAULT_DB_FOLDER= os.environ.get('METAPHLAN_DB_DIR', DEFAULT_DB_FOLDER)
+#Wether to execute a SGB-based analysis
+SGB_ANALYSIS = True
 INDEX = 'latest'
 tax_units = "kpcofgst"
 
 def read_params(args):
-    p = ap.ArgumentParser( description=
+    p = ap.ArgumentParser( description =
             "DESCRIPTION\n"
             " MetaPhlAn version "+__version__+" ("+__date__+"): \n"
             " METAgenomic PHyLogenetic ANalysis for metagenomic taxonomic profiling.\n\n"
@@ -171,12 +188,12 @@ def read_params(args):
     arg = g.add_argument
     arg('--force', action='store_true', help="Force profiling of the input file by removing the bowtie2out file")
     arg('--bowtie2db', metavar="METAPHLAN_BOWTIE2_DB", type=str, default=DEFAULT_DB_FOLDER,
-        help=("Folder containing the MetaPhlAn database."
+        help=("Folder containing the MetaPhlAn database. You can specify the location by exporting the DEFAULT_DB_FOLDER variable in the shell."
               "[default "+DEFAULT_DB_FOLDER+"]\n"))
 
     arg('-x', '--index', type=str, default=INDEX,
         help=("Specify the id of the database version to use. "
-              "If \"latest\", MetaPhlAn will get the latest version.\n" 
+              "If \"latest\", MetaPhlAn will get the latest version.\n"
               "If an index name is provided, MetaPhlAn will try to use it, if available, and skip the online check.\n"
               "If the database files are not found on the local MetaPhlAn installation they\n"
               "will be automatically downloaded [default "+INDEX+"]\n"))
@@ -222,6 +239,7 @@ def read_params(args):
          "'f' : families only\n"
          "'g' : genera only\n"
          "'s' : species only\n"
+         "'t' : SGBs only\n"
          "[default 'a']" )
     arg( '--min_cu_len', metavar="", default="2000", type=int, help =
          "minimum total nucleotide length for the markers in a clade for\n"
@@ -232,16 +250,20 @@ def read_params(args):
          "length smaller than this threshold will be discarded.\n"
          "[default None]\n"   )
     arg( '--add_viruses', action='store_true', help=
-         "Allow the profiling of viral organisms" )
+         "Together with --mpa3, allow the profiling of viral organisms" )
     arg( '--ignore_eukaryotes', action='store_true', help=
          "Do not profile eukaryotic organisms" )
     arg( '--ignore_bacteria', action='store_true', help=
          "Do not profile bacterial organisms" )
     arg( '--ignore_archaea', action='store_true', help=
          "Do not profile archeal organisms" )
+    arg( '--ignore_ksgbs', action='store_true', help=
+         "Do not profile known SGBs (together with --sgb option)" )
+    arg( '--ignore_usgbs', action='store_true', help=
+         "Do not profile unknown SGBs (together with --sgb option)" )
     arg( '--stat_q', metavar="", type = float, default=0.2, help =
          "Quantile value for the robust average\n"
-         "[default 0.2]"   )
+         "[default 0.2]" )
     arg( '--perc_nonzero', metavar="", type = float, default=0.33, help =
          "Percentage of markers with a non zero relative abundance for misidentify a species\n"
          "[default 0.33]"   )
@@ -277,18 +299,23 @@ def read_params(args):
          " * marker_ab_table: normalized marker counts (only when > 0.0 and normalized by metagenome size if --nreads is specified)\n"
          " * marker_counts: non-normalized marker counts [use with extreme caution]\n"
          " * marker_pres_table: list of markers present in the sample (threshold at 1.0 if not differently specified with --pres_th\n"
+         " * clade_specific_strain_tracker: list of markers present for a specific clade, specified with --clade, and all its subclades\n"
          "[default 'rel_ab']" )
     arg( '--nreads', metavar="NUMBER_OF_READS", type=int, default = None, help =
-         "The total number of reads in the original metagenome. It is used only when \n"
-         "-t marker_table is specified for normalizing the length-normalized counts \n"
-         "with the metagenome size as well. No normalization applied if --nreads is not \n"
-         "specified" )
+         "The total number of reads in the original metagenome. It is mandatory when the --input_type is a SAM file." )
     arg( '--pres_th', metavar="PRESENCE_THRESHOLD", type=int, default = 1.0, help =
          'Threshold for calling a marker present by the -t marker_pres_table option' )
     arg( '--clade', metavar="", default=None, type=str, help =
          "The clade for clade_specific_strain_tracker analysis\n"  )
     arg( '--min_ab', metavar="", default=0.1, type=float, help =
          "The minimum percentage abundance for the clade in the clade_specific_strain_tracker analysis\n"  )
+
+    g = p.add_argument_group('Viral Sequence Clusters Analisys')
+    arg = g.add_argument
+    arg("--profile_vsc", action="store_true",help="Add this parameter to profile Viruses with VSCs approach.")
+    arg("--vsc_out", help="Path to the VSCs breadth-of-coverage output file", default="mp3_viruses.csv")
+    arg("--vsc_breadth", help="Minimum Breadth of Coverage for a Viral Group to be reported.\n"
+        "Default is 0.75 (at least 75 percent breadth to report)", default=0.75,type=float)
 
     g = p.add_argument_group('Output arguments')
     arg = g.add_argument
@@ -307,7 +334,8 @@ def read_params(args):
 
     arg( '--legacy-output', action='store_true', help="Old MetaPhlAn2 two columns output\n")
     arg( '--CAMI_format_output', action='store_true', help="Report the profiling using the CAMI output format\n")
-    arg( '--unknown_estimation', action='store_true', help="Scale relative abundances to the number of reads mapping to known clades in order to estimate unknowness\n")
+    arg( '--unclassified_estimation', action='store_true', help="Scale relative abundances to the number of reads mapping to identified clades in order to estimate unclassified taxa\n")
+    arg( '--mpa3', action='store_true', help="Perform the analysis using the MetaPhlAn 3 algorithm\n")
 
     #*************************************************************
     #* Parameters related to biom file generation                *
@@ -325,8 +353,24 @@ def read_params(args):
     arg = g.add_argument
     arg('--nproc', metavar="N", type=int, default=4,
         help="The number of CPUs to use for parallelizing the mapping [default 4]")
+    arg('--subsampling', type=int, default=None,
+        help="Specify the number of reads to be considered from the input metagenomes [default None]")
+    arg('--subsampling_output', type=str, default=None,
+        help="The output file for the subsampled reads. If --subsampling_paired is specified two files are created with suffixes R1 and R2. If not specified the subsampled reads will not be saved.")
+    arg('--subsampling_paired',  type=int, default=None,
+        help="Specify the number of paired reads to be considered from the input metagenomes [default None]")
+    arg('-1', type=str, default=None, metavar='FORWARD_READS',
+        help="Specify the fastq file with forward reads of the input metagenomes. Reads are assumed to be in the same order in the forward and reverse files! [default None]")
+    arg('-2', type=str, default=None, metavar='REVERSE_READS',
+        help="Specify the fastq file with reverse reads of the input metagenomes. Reads are assumed to be in the same order in the forward and reverse files! [default None]")
+    arg('--mapping_subsampling', action='store_true',
+        help="If used, the subsamping will be done on the mapping results instead of on the reads.")
+    arg('--subsampling_seed', type=str, default='1992',
+        help="Random seed to use in the selection of the subsampled reads. Choose \"random\r for a random behaviour") 
     arg('--install', action='store_true',
         help="Only checks if the MetaPhlAn DB is installed and installs it if not. All other parameters are ignored.")
+    arg('--offline', action='store_true',
+        help="If used, MetaPhlAn will not check for new database updates.")
     arg('--force_download', action='store_true',
         help="Force the re-download of the latest MetaPhlAn database.")
     arg('--read_min_len', type=int, default=70,
@@ -342,17 +386,135 @@ def read_params(args):
 def set_mapping_arguments(index, bowtie2_db):
     mpa_pkl = 'mpa_pkl'
     bowtie2db = 'bowtie2db'
+    bt2_ext = 'bt2l' if SGB_ANALYSIS else 'bt2'
 
     if os.path.isfile(os.path.join(bowtie2_db, "{}.pkl".format(index))):
         mpa_pkl = os.path.join(bowtie2_db, "{}.pkl".format(index))
 
-    if glob(os.path.join(bowtie2_db, "{}*.bt2".format(index))):
+    if glob(os.path.join(bowtie2_db, "{}*.{}".format(index, bt2_ext))):
         bowtie2db = os.path.join(bowtie2_db, "{}".format(index))
 
     return (mpa_pkl, bowtie2db)
 
+
+def set_vsc_parameters(index, bowtie2_db):
+    vsc_fna = os.path.join(bowtie2_db, "{}_VSG.fna".format(index))
+    vsc_vinfo = os.path.join(bowtie2_db, "{}_VINFO.csv".format(index))
+
+    if not os.path.isfile(vsc_fna):
+        sys.stderr.write("Error:\n {} file not found in bowtie2db folder ({}). Re-download MetaPhlAn database.".format("{}_VSG.fna".format(index), bowtie2_db))
+        sys.exit(1)
+
+    if not os.path.isfile(vsc_vinfo):
+        sys.stderr.write("Error:\n {} file not found in bowtie2db folder ({}). Re-download MetaPhlAn database.".format("{}_VINFO.csv".format(index), bowtie2_db))
+        sys.exit(1)
+
+    return(vsc_fna, vsc_vinfo)
+
+def vsc_bowtie2(profile_vsc_folder, nproc, file_format="fasta",
+                exe=None,bt2build_exe=None, min_alignment_len=None, read_min_len=0):
+
+    try:
+        subp.check_call([exe if exe else 'bowtie2', "-h"], stdout=DEVNULL)
+        subp.check_call([bt2build_exe if bt2build_exe else 'bowtie2-build', "-h"], stdout=DEVNULL)
+    except Exception as e:
+        sys.stderr.write('OSError: "{}"\nFatal error running BowTie2 and bowtie2-build. Is BowTie2 in the system path?\n'.format(e))
+        sys.exit(1)
+
+    # checking files
+    markerfile= profile_vsc_folder+'/v_mks.fa' 
+    readsfile= profile_vsc_folder+'/v_reads.fq' 
+    vscBamFile= profile_vsc_folder+'/v_align.bam'
+
+    if not os.path.exists(markerfile) or not os.path.exists(readsfile):
+        
+        sys.stderr.write('Error:\nThere was an error in the VSCs file lookup.\n \
+            It may be that there are not enough reads to profile (not enough depth).\n \
+            Passing without reporting any virus.\n')
+        return []
+
+    if os.stat(markerfile).st_size == 0:
+        sys.stderr.write('Warning:\nNo reads aligning to VSC markers in this file.\n')        
+        #return an empty list. MetaPhlAn will continue as normal, without VSCs
+        return []
+
+    #build the db
+
+    bt2build_call = bt2build_exe if bt2build_exe else 'bowtie2-build'
+    dbpath = profile_vsc_folder+'/v_mks'
+    subp.check_call( [bt2build_call, markerfile, dbpath, '-q','--threads', str(nproc)] )
+
+
+    if not all([os.path.exists(".".join([str(dbpath), p]))
+                            for p in ["1.bt2", "2.bt2", "3.bt2", "4.bt2", "rev.1.bt2", "rev.2.bt2"]]):
+        sys.stderr.write('Error:\nThere was an error in running bowtie2-map and not all files were generated. Stopping.\n')
+        sys.exit(1)
+
+    try:
+
+        bt2_call = exe if exe else 'bowtie2'
+        bt2_command = [bt2_call,'--very-sensitive','--quiet','-p',str(nproc),'-x',dbpath,'--no-unal','-U',readsfile]
+        stv_command = ['samtools','view','-bS','-','-@',str(nproc)]
+        sts_command = ['samtools','sort','-','-@',str(nproc),'-o',vscBamFile]
+        sti_command = ['samtools','index',vscBamFile]
+
+        p3 = subp.Popen(sts_command, stdin=subp.PIPE)
+        p2 = subp.Popen(stv_command, stdin=subp.PIPE, stdout=p3.stdin)
+        p1 = subp.Popen(bt2_command, stdout=p2.stdin)
+
+        p1.communicate() 
+        p2.communicate()
+        p3.communicate()
+
+        #index
+        subp.check_call(sti_command)
+
+    except Exception as e:
+        sys.stderr.write('Error: "{}"\nFatal error running BowTie2 for Viruses\n'.format(e))
+        sys.exit(1)
+
+    if not os.path.exists(vscBamFile):
+        sys.stderr.write('Error:\nUnable to create BAM FILE for viruses\n')
+        sys.exit(1)
+
+    try:
+        bamHandle = pysam.AlignmentFile(vscBamFile, "rb")
+    except Exception as e:
+        sys.stderr.write('Error: "{}"\nCheck PySam is correctly working\n'.format(e))
+        sys.exit(1)
+
+    VSC_report=[]
+
+    for c, length in zip(bamHandle.references,bamHandle.lengths):
+        coverage_positions = {}
+
+        for pileupcolumn in bamHandle.pileup(c):
+
+            tCoverage = 0
+            for pileupread in pileupcolumn.pileups:
+
+                if not pileupread.is_del and not pileupread.is_refskip \
+                        and pileupread.alignment.query_qualities[pileupread.query_position] >= 20 \
+                        and pileupread.alignment.query_sequence[pileupread.query_position].upper() in ('A','T','C','G'):
+                        tCoverage +=1
+
+            if tCoverage >= 1:
+                coverage_positions[pileupcolumn.pos] = tCoverage
+        
+        breadth = float(len(coverage_positions.keys()))/float(length)
+        
+        if breadth > 0:
+            cvals=list(coverage_positions.values())
+            VSC_report.append({'M-Group/Cluster':c.split('|')[2].split('-')[0], 'genomeName':c, 'len':length, 'breadth_of_coverage':breadth, 'depth_of_coverage_mean': np.mean(cvals), 'depth_of_coverage_median': np.median(cvals)})
+
+    if bamHandle:
+        bamHandle.close()
+
+    return VSC_report
+
+
 def run_bowtie2(fna_in, outfmt6_out, bowtie2_db, preset, nproc, min_mapq_val, file_format="fasta",
-                exe=None, samout=None, min_alignment_len=None, read_min_len=0):
+                exe=None, samout=None, min_alignment_len=None, read_min_len=0, profile_vsc_folder=False):
     # checking read_fastx.py
     read_fastx = "read_fastx.py"
 
@@ -380,7 +542,7 @@ def run_bowtie2(fna_in, outfmt6_out, bowtie2_db, preset, nproc, min_mapq_val, fi
         else:
             readin = subp.Popen([read_fastx, '-l', str(read_min_len)], stdin=sys.stdin, stdout=subp.PIPE, stderr=subp.PIPE)
 
-        bowtie2_cmd = [exe if exe else 'bowtie2', "--quiet", "--no-unal", "--{}".format(preset),
+        bowtie2_cmd = [exe if exe else 'bowtie2', "--seed", "1992", "--quiet", "--no-unal", "--{}".format(preset),
                        "-S", "-", "-x", bowtie2_db]
 
         if int(nproc) > 1:
@@ -394,6 +556,11 @@ def run_bowtie2(fna_in, outfmt6_out, bowtie2_db, preset, nproc, min_mapq_val, fi
         p = subp.Popen(bowtie2_cmd, stdout=subp.PIPE, stdin=readin.stdout)
         readin.stdout.close()
         lmybytes, outf = (mybytes, bz2.BZ2File(outfmt6_out, "w")) if outfmt6_out.endswith(".bz2") else (str, open(outfmt6_out, "w"))
+
+        if profile_vsc_folder:
+            CREAD=[]
+            list_of_viral_markers = open(profile_vsc_folder+'/viralmk.txt','w')
+
         try:
             if samout:
                 if samout[-4:] == '.bz2':
@@ -414,7 +581,27 @@ def run_bowtie2(fna_in, outfmt6_out, bowtie2_db, preset, nproc, min_mapq_val, fi
                         if mapq_filter(o[2], int(o[4]), min_mapq_val) :  # filter low mapq reads
                             if ((min_alignment_len is None) or
                                     (max([int(x.strip('M')) for x in re.findall(r'(\d*M)', o[5]) if x]) >= min_alignment_len)):
+                                                                # Profile viral markers in a different way
+                                if profile_vsc_folder and o[2].startswith('VDB|'):
+
+                                    mCluster = o[2]
+                                    mGroup = o[2].split('|')[2].split('-')[0]
+
+                                    list_of_viral_markers.write(mGroup+'\t'+mCluster+'\n')
+
+                                    if (hex(int(o[1]) & 0x10) == '0x0'): #front read
+                                        rr=SeqRecord(Seq(o[9]),letter_annotations={'phred_quality':[ord(_)-33 for _ in o[10][::-1]]}, id=o[0])
+                                    else:
+                                        rr=SeqRecord(Seq(o[9]).reverse_complement(),letter_annotations={'phred_quality':[ord(_)-33 for _ in o[10][::-1]]}, id=o[0])
+
+                                    CREAD.append(rr)
+
+                                # normal route for non-viral markers
                                 outf.write(lmybytes("\t".join([ o[0], o[2].split('/')[0] ]) + "\n"))
+
+        if profile_vsc_folder and os.path.isdir(profile_vsc_folder):
+            SeqIO.write(CREAD,profile_vsc_folder+'/v_reads.fq','fastq')
+            list_of_viral_markers.close()
 
         if samout:  
             sam_file.close()
@@ -431,7 +618,6 @@ def run_bowtie2(fna_in, outfmt6_out, bowtie2_db, preset, nproc, min_mapq_val, fi
             if not avg_read_length:
                 sys.stderr.write('Fatal error running MetaPhlAn. The average read length was not estimated.\nPlease check your input files.\n')
                 sys.exit(1)
-
             outf.write(lmybytes('#nreads\t{}\n'.format(int(nreads))))
             outf.write(lmybytes('#avg_read_length\t{}'.format(avg_read_length)))
             outf.close()
@@ -510,8 +696,9 @@ class TaxClade:
         return [(m,float(n)*1000.0/(np.absolute(self.markers2lens[m] - self.avg_read_length) +1) )
                     for m,n in self.markers2nreads.items()]
 
-    def compute_mapped_reads( self ):
-        if self.name.startswith('s__'):
+    def compute_mapped_reads( self ):    
+        tax_level = 't__' if SGB_ANALYSIS else 's__'
+        if self.nreads != 0 or self.name.startswith(tax_level):
             return self.nreads
         for c in self.children.values():
             self.nreads += c.compute_mapped_reads()
@@ -572,7 +759,7 @@ class TaxClade:
         quant = int(self.quantile*len(rat_nreads))
         ql,qr,qn = (quant,-quant,quant) if quant else (None,None,0)
 
-        if self.name[0] == 't' and (len(self.father.children) > 1 or "_sp" in self.father.name or "k__Viruses" in self.get_full_name()):
+        if not SGB_ANALYSIS and self.name[0] == 't' and (len(self.father.children) > 1 or "_sp" in self.father.name or "k__Viruses" in self.get_full_name()):
             non_zeros = float(len([n for r,n in rat_nreads if n > 0]))
             nreads = float(len(rat_nreads))
             if nreads == 0.0 or non_zeros / nreads < 0.7:
@@ -649,13 +836,17 @@ class TaxTree:
             father = self.root
             for i in range(len(clade)):
                 clade_lev = clade[i]
-                clade_taxid = taxids[i] if i < 7 and taxids is not None else None
+                if SGB_ANALYSIS:
+                    clade_taxid = taxids[i] if i < 8 and taxids is not None else None
+                else:
+                    clade_taxid = taxids[i] if i < 7 and taxids is not None else None
                 if not clade_lev in father.children:
                     father.add_child(clade_lev, tax_id=clade_taxid)
                     self.all_clades[clade_lev] = father.children[clade_lev]
+                if SGB_ANALYSIS: father = father.children[clade_lev]
                 if clade_lev[0] == "t":
                     self.taxa2clades[clade_lev[3:]] = father
-                father = father.children[clade_lev]
+                if not SGB_ANALYSIS: father = father.children[clade_lev]
                 if clade_lev[0] == "t":
                     father.glen = lenc
 
@@ -692,18 +883,27 @@ class TaxTree:
     def add_reads(  self, marker, n,
                     add_viruses = False,
                     ignore_eukaryotes = False,
-                    ignore_bacteria = False, ignore_archaea = False  ):
+                    ignore_bacteria = False, ignore_archaea = False, 
+                    ignore_ksgbs = False, ignore_usgbs = False  ):
         clade = self.markers2clades[marker]
         cl = self.all_clades[clade]
-        if ignore_eukaryotes or ignore_bacteria or ignore_archaea or not add_viruses:
+        if ignore_bacteria or ignore_archaea or ignore_eukaryotes:
             cn = cl.get_full_name()
-            if not add_viruses and cn.startswith("k__Vir"):
-                return (None, None)
-            if ignore_eukaryotes and cn.startswith("k__Eukaryota"):
-                return (None, None)
             if ignore_archaea and cn.startswith("k__Archaea"):
                 return (None, None)
             if ignore_bacteria and cn.startswith("k__Bacteria"):
+                return (None, None)
+            if ignore_eukaryotes and cn.startswith("k__Eukaryota"):
+                return (None, None)
+        if not SGB_ANALYSIS and not add_viruses:
+            cn = cl.get_full_name()
+            if not add_viruses and cn.startswith("k__Vir"):
+                return (None, None)
+        if SGB_ANALYSIS and (ignore_ksgbs or ignore_usgbs):
+            cn = cl.get_full_name()
+            if ignore_ksgbs and not '_SGB' in cn.split('|')[-2]:
+                return (None, None)
+            if ignore_usgbs and '_SGB' in cn.split('|')[-2]:
                 return (None, None)
         # while len(cl.children) == 1:
             # cl = list(cl.children.values())[0]
@@ -740,7 +940,7 @@ class TaxTree:
 
         for tax_label, clade in clade2abundance_n.items():
             for clade_label, tax_id, abundance in sorted(clade.get_all_abundances(), key=lambda pars:pars[0]):
-                if clade_label[:3] != 't__':
+                if SGB_ANALYSIS or clade_label[:3] != 't__':
                     if not tax_lev:
                         if clade_label not in self.all_clades:
                             to = tax_units.index(clade_label[0])
@@ -754,7 +954,8 @@ class TaxTree:
                         else:
                             glen = self.all_clades[clade_label].glen
                             tax_id = self.all_clades[clade_label].get_full_taxids()
-                            if 's__' in clade_label and abundance > 0:
+                            tax_level = 't__' if SGB_ANALYSIS else 's__' 
+                            if tax_level in clade_label and abundance > 0:
                                 self.all_clades[clade_label].nreads = int(np.floor(abundance*glen))
 
                             clade_label = self.all_clades[clade_label].get_full_name()
@@ -770,7 +971,7 @@ class TaxTree:
             tot_reads += clade.compute_mapped_reads()
 
         for clade_label, clade in self.all_clades.items():
-            if clade.name[:3] != 't__':
+            if SGB_ANALYSIS or clade.name[:3] != 't__':
                 nreads = clade.nreads
                 clade_label = clade.get_full_name()
                 tax_id = clade.get_full_taxids()
@@ -781,18 +982,26 @@ class TaxTree:
         ret_r = dict([( tax, (abundance, clade2est_nreads[tax] )) for tax, abundance in clade2abundance.items() if tax in clade2est_nreads])
 
         if tax_lev:
-            ret_d[("UNKNOWN", '-1')] = 1.0 - sum(ret_d.values())  
+            ret_d[("UNCLASSIFIED", '-1')] = 1.0 - sum(ret_d.values())
         return ret_d, ret_r, tot_reads
 
 def mapq_filter(marker_name, mapq_value, min_mapq_val):
-    if 'GeneID:' in marker_name:
+    ##if 'GeneID:' in marker_name:
+    if 'GeneID:' in marker_name or 'VDB' in marker_name:
         return True
     else:
         if mapq_value > min_mapq_val:
             return True
     return False
 
-def map2bbh(mapping_f, min_mapq_val, input_type='bowtie2out', min_alignment_len=None):
+
+def separate_reads2markers(reads2markers):
+    if not SGB_ANALYSIS:
+        return reads2markers, {}
+    else:
+        return {r: m for r, m in reads2markers.items() if ('SGB' in m or 'EUK' in m) and not 'VDB' in m}, {r: m for r, m in reads2markers.items() if 'VDB' in m and not ('SGB' in m or 'EUK' in m)}
+
+def map2bbh(mapping_f, min_mapq_val, input_type='bowtie2out', min_alignment_len=None, nreads=None, mapping_subsampling=False, subsampling=None, subsampling_seed='1992', remove_input=False):
     if not mapping_f:
         ras, ras_line, inpf = plain_read_and_split, plain_read_and_split_line, sys.stdin
     else:
@@ -810,10 +1019,11 @@ def map2bbh(mapping_f, min_mapq_val, input_type='bowtie2out', min_alignment_len=
             if r.startswith('#') and 'nreads' in r:
                 n_metagenome_reads = int(c)
             if r.startswith('#') and 'avg_read_length' in r:
-                avg_read_length = float(c)            
+                avg_read_length = float(c)
             else:
                 reads2markers[r] = c
     elif input_type == 'sam':
+        n_metagenome_reads = nreads 
         for line in inpf:
             o = ras_line(line)
             if ((o[0][0] != '@') and #no header
@@ -824,7 +1034,29 @@ def map2bbh(mapping_f, min_mapq_val, input_type='bowtie2out', min_alignment_len=
             ):
                     reads2markers[o[0]] = o[2].split('/')[0]
     inpf.close()
-    markers2reads = defdict(set)
+    
+    if subsampling is not None and mapping_subsampling:
+        if subsampling >= n_metagenome_reads:
+            sys.stderr.write("WARNING: The specified subsampling ({}) is equal or higher than the original number of reads ({}). Subsampling will be skipped.\n".format(subsampling, n_metagenome_reads))
+        else:
+            reads2markers =  dict(sorted(reads2markers.items()))
+            if subsampling_seed.lower() != 'random':
+                random.seed(int(subsampling_seed))
+            reads2filtmarkers = {}
+            sgb_reads2markers, viral_reads2markers = separate_reads2markers(reads2markers)            
+            n_sgb_mapped_reads = int((len(sgb_reads2markers) * subsampling) / n_metagenome_reads)
+            reads2filtmarkers = { r:sgb_reads2markers[r] for r in random.sample(list(sgb_reads2markers.keys()), n_sgb_mapped_reads) }     
+            if SGB_ANALYSIS:       
+                n_viral_mapped_reads = int((len(viral_reads2markers) * subsampling) / n_metagenome_reads)
+                reads2filtmarkers.update({ r:viral_reads2markers[r] for r in random.sample(list(viral_reads2markers.keys()), n_viral_mapped_reads) })            
+            reads2markers = reads2filtmarkers
+            sgb_reads2markers.clear()
+            viral_reads2markers.clear()
+            n_metagenome_reads = subsampling
+    elif subsampling is None and n_metagenome_reads < 10000:
+        sys.stderr.write("WARNING: The number of reads in the sample ({}) is below the recommended minimum of 10,000 reads.\n".format(n_metagenome_reads))
+        
+    markers2reads = defdict(set)   
     for r, m in reads2markers.items():
         markers2reads[m].add(r)
 
@@ -915,18 +1147,198 @@ def maybe_generate_biom_file(tree, pars, abundance_predictions):
 
     return True
 
+def _make_gen_fastq(reader):
+    b = reader(1024 * 1024) 
+    while (b):
+        yield b
+        b = reader(1024 * 1024)
+
+def rawpycount(filename):
+    f = bz2.BZ2File(filename, 'rb') if filename.endswith(".bz2") else gzip.open(filename, 'rb') if filename.endswith('.gz') else open(filename, 'rb')
+    f_gen = _make_gen_fastq(f.read)
+    n_metagenome_reads = sum( buf.count(b'\n') for buf in f_gen)
+    f.close()
+    return n_metagenome_reads
+
+def subsample_file(inp, paired, subsampling, out, sample):         
+    length, read_num = 0, -1
+    counter=0
+    out_l = out
+    for inp_f in inp.split(','):
+        if paired:
+            length, read_num = 0, -1  
+            out=out_l[counter]
+            counter+=1
+        line = 1
+        reader = bz2.open(inp_f, 'rt') if inp_f.endswith(".bz2") else gzip.open(inp_f, 'rt') if inp_f.endswith('.gz') else open(inp_f, 'r')
+        while (line and length < subsampling):
+            line = reader.readline()
+            read_num += 1
+            if read_num in sample:
+                length += 1
+                out.write(line)       
+                for _ in range(3):
+                    out.write(reader.readline())
+            else:
+                for _ in range(3):
+                    reader.readline()
+        reader.close()
+    out.close()
+    
+def subsample_reads(inp, subsampling, subsampling_seed, subsampling_output, tmp_dir, paired):
+
+    n_metagenome_reads = execute_pool(((rawpycount, inp_f) for inp_f in inp.split(',')), 2)
+    n_metagenome_reads = [int(n/4) for n in n_metagenome_reads]
+
+    if subsampling >= sum(n_metagenome_reads):
+        sys.stderr.write("WARNING: The specified subsampling ({}) is equal or higher than the original number of reads ({}). Subsampling will be skipped.\n".format(subsampling, sum(n_metagenome_reads))) 
+        return inp, None
+
+    if paired:
+        subsampling //= 2
+        if n_metagenome_reads[0] != n_metagenome_reads[1]:
+            sys.stderr.write("Error: The specified reads file are not the same length! Make sure the forward and reverse reads are files are not damaged and reads are in the same order. Exiting ...\n\n") 
+            sys.exit(1)
+        n_metagenome_reads = n_metagenome_reads[0]
+    else:
+        n_metagenome_reads = sum(n_metagenome_reads)
+
+
+    if subsampling_seed.lower() != 'random':
+        random.seed(int(subsampling_seed))
+        
+    sample = set(random.sample(range(n_metagenome_reads), subsampling))
+    
+    if subsampling_output is None:
+        if paired:
+            subsampling_output = list()
+            out=list()
+            for _ in inp.split(','):
+                out_f = tf.NamedTemporaryFile(dir=tmp_dir, mode='w', delete=False)
+                out.append(out_f)
+                subsampling_output.append(out_f.name)
+        else:
+            out = tf.NamedTemporaryFile(dir=tmp_dir, mode='w', delete=False)
+            subsampling_output=out.name
+    else:
+        if paired:
+            r, ext = os.path.splitext(subsampling_output)
+
+            subsampling_output = list()
+            out = list()
+
+            subsampling_output.append('.'.join([r, 'R1'+ext]))
+            subsampling_output.append('.'.join([r, 'R2'+ext]))
+
+            for s in subsampling_output:
+                out.append(bz2.open(s, 'wt') if s.endswith(".bz2") else gzip.open(s, 'wt') if s.endswith('.gz') else open(s, 'w'))
+        else:
+            out = bz2.open(subsampling_output, 'wt') if subsampling_output.endswith(".bz2") else gzip.open(subsampling_output, 'wt') if subsampling_output.endswith('.gz') else open(subsampling_output, 'w')
+            
+    subsample_file(inp, paired, subsampling, out, sample)
+
+    if isinstance(subsampling_output, list):
+        subsampling_output = ','.join(subsampling_output)
+        subsampling = subsampling*2
+
+
+    return subsampling_output, subsampling
+
 def main():
     ranks2code = { 'k' : 'superkingdom', 'p' : 'phylum', 'c':'class',
                    'o' : 'order', 'f' : 'family', 'g' : 'genus', 's' : 'species'}
     pars = read_params(sys.argv)
-    ESTIMATE_UNK = pars['unknown_estimation']
 
+    #Set SGB- / species- analysis
+    global SGB_ANALYSIS
+    SGB_ANALYSIS = not pars['mpa3']
+
+    ESTIMATE_UNK = pars['unclassified_estimation']
+
+    if pars['subsampling'] and pars['subsampling_paired']:
+        sys.stderr.write("Error: You specified both --subsampling and --subsampling_paired. Choose only one of the two options. Exiting...")
+        sys.exit(1)
+
+    if pars['subsampling']:
+        sys.stderr.write("WARNING: If you use --subsampling the reads will be subsampled NOT taking into account paired information. Use --subsampling_paired if you have paired ends reads.\n".format(pars['subsampling']))
+    
+    if pars['mapping_subsampling'] and pars['subsampling'] is None:
+        sys.stderr.write("Error: The --mapping_subsampling parameter should be used together with the --subsampling parameter. Exiting...\n\n")
+        sys.exit(1)
+
+    if pars['subsampling_paired']:
+        subsampling_paired=True
+        pars['subsampling']=pars['subsampling_paired']
+    else:
+        subsampling_paired=False
+
+    if subsampling_paired and (pars['1'] is None or pars['2'] is None):
+        sys.stderr.write("Error: If you specify --subsampling_paired you have to provide forward and reverse reads as -1 and -2 respectively. Reads are assumed to be in the same order in the two files.\n Exiting...\n\n".format(pars['subsampling']))
+        sys.exit(1)
+    
+    if pars['subsampling'] is not None and pars['subsampling'] < 10000:
+        sys.stderr.write("WARNING: The specified subsampling ({}) is below the recommended minimum of 10,000 reads.\n".format(pars['subsampling']))
+    
+    if not (pars['subsampling_seed'].lower() == 'random' or pars['subsampling_seed'].isdigit()):
+        sys.stderr.write("Error: The --subsampling_seed parameter is not accepted. It should contain an integer number or \"random\". Exiting...\n\n")
+        sys.exit(1)
+        
+    if not pars['mapping_subsampling'] and pars['subsampling'] is not None:
+        if pars['input_type'] != 'fastq':
+            sys.stderr.write("Error: The reads' subsampling procedure requires fastq input! Exiting...\n\n")
+            sys.exit(1)
+        elif (not pars['inp']) and (not subsampling_paired):
+            sys.stderr.write("Error: Input reads for the subsampling must be provided as parameter. Stdin input is not allowed! Exiting...\n\n")
+            sys.exit(1)
+        
+        if subsampling_paired:
+            if not os.path.exists(pars['2']) or not os.path.exists(pars['1']):
+                sys.stderr.write("Error: Files passed with -1 ({}) or -2 ({}) not found. Exiting...\n\n".format(pars['1'],pars['2']))
+                sys.exit(1)
+
+            if pars['inp']:
+                sys.stderr.write("WARNING: since --subsampling_paired has been specified, reads are taken from -1 ({}) and -2 ({}), not from -inp.\n".format(pars['1'],pars['2']))
+            pars['inp'] = pars['1']+','+pars['2']
+
+        pars['inp'], pars['subsampling'] = subsample_reads(pars['inp'], pars['subsampling'], pars['subsampling_seed'], pars['subsampling_output'], pars['tmp_dir'], paired=subsampling_paired)
+        
     # check if the database is installed, if not then install
-    pars['index'] = check_and_install_database(pars['index'], pars['bowtie2db'], pars['bowtie2_build'], pars['nproc'], pars['force_download'])
+    pars['index'] = check_and_install_database(pars['index'], pars['bowtie2db'], pars['bowtie2_build'], pars['nproc'], pars['force_download'], pars['offline'])
 
     if pars['install']:
         sys.stderr.write('The database is installed\n')
         return
+
+    #if we are to profile viral clusters:
+
+    if pars['profile_vsc']:
+        #TODO: comply to other input types
+        if pars['input_type'] != 'fastq':
+            sys.stderr.write("The Viral Sequence Clusters mode requires fastq input!\n")
+            sys.exit(1)
+        
+        if not pars['vsc_out']:
+            sys.stderr.write("The Viral Sequence Clusters mode requires to specify an output file with the --vsc_out parameter\n")
+            sys.exit(1)
+
+        tmpvirdir=tf.TemporaryDirectory(dir=pars['tmp_dir'])
+        viralTempFolder=tmpvirdir.name
+        
+        # Uncomment to preserve tmp dir
+        #tmpvirdir=tf.mkdtemp(dir=pars['tmp_dir'])
+        #viralTempFolder=tmpvirdir
+        #print("VF: ",viralTempFolder)
+
+        vsc_fna, vsc_vinfo = set_vsc_parameters(pars['index'], pars['bowtie2db'])
+
+        # implies SGBs (uses the same database with SGBs, so this is needed to avoid
+        # the need to specify --sgb when using --profile_vscs)
+        SGB_ANALYSIS = True
+
+
+    else:
+        viralTempFolder = None
+
 
     # set correct map_pkl and bowtie2db variables
     pars['mpa_pkl'], pars['bowtie2db'] = set_mapping_arguments(pars['index'], pars['bowtie2db'])
@@ -986,10 +1398,16 @@ def main():
                 if os.path.exists(pars['bowtie2out']):
                     os.remove( pars['bowtie2out'] )
 
+        bt2_ext = 'bt2l' if SGB_ANALYSIS else 'bt2'            
         if bow and not all([os.path.exists(".".join([str(pars['bowtie2db']), p]))
-                            for p in ["1.bt2", "2.bt2", "3.bt2", "4.bt2", "rev.1.bt2", "rev.2.bt2"]]):
+                            for p in ["1." + bt2_ext, "2." + bt2_ext, "3." + bt2_ext, "4." + bt2_ext, "rev.1." + bt2_ext, "rev.2." + bt2_ext]]):
             sys.stderr.write("No MetaPhlAn BowTie2 database found (--index "
                              "option)!\nExpecting location {}\nExiting..."
+                             .format(pars['bowtie2db']))
+            sys.exit(1)
+        if bow and not (abs(os.path.getsize(".".join([str(pars['bowtie2db']), "1." + bt2_ext])) - os.path.getsize(".".join([str(pars['bowtie2db']), "rev.1." + bt2_ext]))) <= 1000):
+            sys.stderr.write("Partial MetaPhlAn BowTie2 database found at {}. "
+                             "Please remove and rebuild the database.\nExiting..."
                              .format(pars['bowtie2db']))
             sys.exit(1)
 
@@ -997,7 +1415,11 @@ def main():
             run_bowtie2(pars['inp'], pars['bowtie2out'], pars['bowtie2db'],
                                 pars['bt2_ps'], pars['nproc'], file_format=pars['input_type'],
                                 exe=pars['bowtie2_exe'], samout=pars['samout'],
-                                min_alignment_len=pars['min_alignment_len'], read_min_len=pars['read_min_len'], min_mapq_val=pars['min_mapq_val'])
+
+                                min_alignment_len=pars['min_alignment_len'], read_min_len=pars['read_min_len'], min_mapq_val=pars['min_mapq_val'],profile_vsc_folder=viralTempFolder)
+            if pars['subsampling_output'] is None and not pars['mapping_subsampling'] and pars['subsampling'] is not None:
+                for inp_f in pars['inp'].split(','):
+                    os.remove(inp_f)
             pars['input_type'] = 'bowtie2out'
         pars['inp'] = pars['bowtie2out'] # !!!
     with bz2.BZ2File( pars['mpa_pkl'], 'r' ) as a:
@@ -1006,22 +1428,71 @@ def main():
     REPORT_MERGED = mpa_pkl.get('merged_taxon',False)
     tree = TaxTree( mpa_pkl, ignore_markers )
     tree.set_min_cu_len( pars['min_cu_len'] )
-    
-    markers2reads, n_metagenome_reads, avg_read_length = map2bbh(pars['inp'], pars['min_mapq_val'], pars['input_type'], pars['min_alignment_len'])
+
+    if pars['input_type'] == 'sam' and not pars['nreads']:
+        sys.stderr.write(
+                "Please provide the size of the metagenome using the "
+                "--nreads parameter when running MetaPhlAn using SAM files as input"
+                "\nExiting...\n\n" )
+        sys.exit(1)
+
+    markers2reads, n_metagenome_reads, avg_read_length = map2bbh(pars['inp'], pars['min_mapq_val'], pars['input_type'], pars['min_alignment_len'], pars['nreads'], pars['mapping_subsampling'], pars['subsampling'], pars['subsampling_seed'])
+
+    if pars['profile_vsc']:
+        
+        try:
+            VSCs_markers = SeqIO.index(vsc_fna, "fasta")
+        except Exception as e:
+            sys.stderr.write('Error: "{}"\nCould not access to {}.\n'.format(e,vsc_fna))
+            sys.exit(1)
+
+        with open(viralTempFolder+'/viralmk.txt') as viral_markers_to_remap:
+
+            allViralMarkers = {}
+            for vmarker in viral_markers_to_remap:
+                group,marker = vmarker.strip().split()
+                if group not in allViralMarkers:
+                    allViralMarkers[group] = [marker]
+                else:
+                    allViralMarkers[group].append(marker)
+
+            selectedMakrers=[]
+            for grp,v in allViralMarkers.items():
+
+                cv=Counter(v)
+                if (len(cv) > 1):
+                    normalized_occurrencies=sorted([(mk,mk_occurrencies,len(VSCs_markers[mk].seq)) for (mk,mk_occurrencies) in cv.items()],key=lambda x: x[1]/x[2],reverse=True)
+                    topMarker= VSCs_markers[normalized_occurrencies[0][0]] #name of the viralGenome
+                else:
+                    topMarker=VSCs_markers[v[0]] # the only hitted viralGenome is the winning one
+
+                selectedMakrers.append(topMarker)
+
+
+            VSCs_markers.close()
+            SeqIO.write( selectedMakrers,viralTempFolder+'/v_mks.fa','fasta' )
+
+            VSC_report = vsc_bowtie2(viralTempFolder, pars['nproc'], file_format=pars['input_type'],
+                        exe=pars['bowtie2_exe'], bt2build_exe=pars['bowtie2_build']) 
+
+
+            if not VSC_report == []:
+                with open(pars['vsc_out'],'w') as outf:
+
+                    outf.write('#{}\n'.format(pars['index']))
+                    outf.write('#{}\n'.format(' '.join(sys.argv)))
+                    outf.write('#SampleID\t{}\n'.format(pars['sample_id']))
+                    vsc_out_df = pd.DataFrame.from_dict(VSC_report).query('breadth_of_coverage >= {}'.format(pars['vsc_breadth']))
+                    vsc_info_df = pd.read_table(vsc_vinfo, sep='\t')
+                    vsc_out_df = vsc_out_df.merge(vsc_info_df, on='M-Group/Cluster').sort_values(by='breadth_of_coverage', ascending=False).set_index('M-Group/Cluster')
+
+                    vsc_out_df.to_csv(outf,sep='\t',na_rep='-')
+
 
     tree.set_stat( pars['stat'], pars['stat_q'], pars['perc_nonzero'], avg_read_length, pars['avoid_disqm'])
 
     if no_map:
         os.remove( pars['inp'] )
-
-    if ESTIMATE_UNK and pars['input_type'] == 'sam':
-        n_metagenome_reads = pars['nreads']
-        if not n_metagenome_reads and not pars['nreads']:
-            sys.stderr.write(
-                    "Please provide the size of the metagenome using the "
-                    "--nreads parameter when running MetaPhlAn using SAM files as input"
-                    "\nExiting...\n\n" )
-            sys.exit(1)
 
     map_out = []
     for marker,reads in sorted(markers2reads.items(), key=lambda pars: pars[0]):
@@ -1032,6 +1503,8 @@ def main():
                                   ignore_eukaryotes = pars['ignore_eukaryotes'],
                                   ignore_bacteria = pars['ignore_bacteria'],
                                   ignore_archaea = pars['ignore_archaea'],
+                                  ignore_ksgbs = pars['ignore_ksgbs'],
+                                  ignore_usgbs = pars['ignore_usgbs']
                                   )
         if tax_seq:
             map_out +=["\t".join([r,tax_seq, ids_seq]) for r in sorted(reads)]
@@ -1047,10 +1520,28 @@ def main():
         if not MPA2_OUTPUT:
             outf.write('#{}\n'.format(pars['index']))
             outf.write('#{}\n'.format(' '.join(sys.argv)))
+            outf.write('#{} reads processed\n'.format(n_metagenome_reads))
+        
+        if pars['t'] == 'rel_ab_w_read_stats':
+            outf.write('#Average read length {}\n'.format(avg_read_length))           
 
         if not CAMI_OUTPUT:
             outf.write('#' + '\t'.join((pars["sample_id_key"], pars["sample_id"])) + '\n')
-        
+
+        if ESTIMATE_UNK:
+            mapped_reads = 0
+            cl2pr = tree.clade_profiles( pars['tax_lev']+"__" if pars['tax_lev'] != 'a' else None  )
+            cl2ab, _, _ = tree.relative_abundances( pars['tax_lev']+"__" if pars['tax_lev'] != 'a' else None )
+            confident_taxa = [taxstr for (taxstr, _),relab in cl2ab.items() if relab > 0.0]
+            for c, m in cl2pr.items():
+                if c in confident_taxa:
+                    markers_cov = [a  / 1000 for _, a in m if a > 0]
+                    mapped_reads += np.mean(markers_cov) * tree.all_clades[c.split('|')[-1]].glen
+            # If the mapped reads are over-estimated, set the ratio at 1
+            fraction_mapped_reads = min(mapped_reads/float(n_metagenome_reads), 1.0)
+        else:
+            fraction_mapped_reads = 1.0
+      
         if pars['t'] == 'reads_map':
             if not MPA2_OUTPUT:
                outf.write('#read_id\tNCBI_taxlineage_str\tNCBI_taxlineage_ids\n')
@@ -1058,11 +1549,8 @@ def main():
 
         elif pars['t'] == 'rel_ab':
             if CAMI_OUTPUT:
-                outf.write('''@SampleID:{}\n
-                           @Version:0.10.0\n
-                           @Ranks:superkingdom|phylum|class|order|family|genus|species|strain\n
-                           @@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE\n'''.format(pars["sample_id"]))
-            if not MPA2_OUTPUT:
+                outf.write('''@SampleID:{}\n@Version:0.10.0\n@Ranks:superkingdom|phylum|class|order|family|genus|species|strain\n@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE\n'''.format(pars["sample_id"]))
+            if not MPA2_OUTPUT and not CAMI_OUTPUT:
                 if not pars['use_group_representative']:
                     outf.write('#clade_name\tNCBI_tax_id\trelative_abundance\tadditional_species\n')
                 else:
@@ -1070,9 +1558,6 @@ def main():
 
             cl2ab, _, tot_nreads = tree.relative_abundances(
                         pars['tax_lev']+"__" if pars['tax_lev'] != 'a' else None )
-
-            # If the mapped reads are over-estimated, set the ratio at 1
-            fraction_mapped_reads = min(tot_nreads/float(n_metagenome_reads), 1.0) if ESTIMATE_UNK else 1.0
             
             outpred = [(taxstr, taxid,round(relab*100.0,5)) for (taxstr, taxid), relab in cl2ab.items() if relab > 0.0]
             has_repr = False
@@ -1081,14 +1566,14 @@ def main():
                 if CAMI_OUTPUT:
                     for clade, taxid, relab in sorted(  outpred, reverse=True,
                                         key=lambda x:x[2]+(100.0*(8-(x[0].count("|"))))):
-                        if taxid:
+                        if taxid and clade.split('|')[-1][0] != 't':
                             rank = ranks2code[clade.split('|')[-1][0]]
                             leaf_taxid = taxid.split('|')[-1]
                             taxpathsh = '|'.join([remove_prefix(name) if '_unclassified' not in name else '' for name in clade.split('|')])
                             outf.write( '\t'.join( [ leaf_taxid, rank, taxid, taxpathsh, str(relab*fraction_mapped_reads) ] ) + '\n' )
                 else:
                     if ESTIMATE_UNK:
-                        outf.write( "\t".join( [    "UNKNOWN",
+                        outf.write( "\t".join( [    "UNCLASSIFIED",
                                                     "-1",
                                                     str(round((1-fraction_mapped_reads)*100,5)),""]) + "\n" )
                                                     
@@ -1096,10 +1581,10 @@ def main():
                                         key=lambda x:x[2]+(100.0*(8-(x[0].count("|"))))):
                         add_repr = ''
                         if REPORT_MERGED and (clade, taxid) in mpa_pkl['merged_taxon']:
-                            if pars['use_group_representative']:
+                            if pars['use_group_representative'] and not SGB_ANALYSIS:
                                 if '_group' in clade:
                                     clade, taxid, _ = sorted(mpa_pkl['merged_taxon'][(clade, taxid)], key=lambda x:x[2], reverse=True)[0]
-                            else:
+                            elif not pars['use_group_representative']:
                                 add_repr = '{}'.format(','.join( [ n[0] for n in mpa_pkl['merged_taxon'][(clade, taxid)]] ))
                                 has_repr = True
                         if not MPA2_OUTPUT:
@@ -1117,33 +1602,33 @@ def main():
                                     )
             else:
                 if not MPA2_OUTPUT:
-                    outf.write( "UNKNOWN\t-1\t100.0\t\n" )
+                    outf.write( "UNCLASSIFIED\t-1\t100.0\t\n" )
                 else:
-                    outf.write( "UNKNOWN\t100.0\n" )
+                    outf.write( "UNCLASSIFIED\t100.0\n" )
+                sys.stderr.write("WARNING: MetaPhlAn did not detect any microbial taxa in the sample.\n")
             maybe_generate_biom_file(tree, pars, outpred)
 
         elif pars['t'] == 'rel_ab_w_read_stats':
             cl2ab, rr, tot_nreads = tree.relative_abundances(
                         pars['tax_lev']+"__" if pars['tax_lev'] != 'a' else None )
 
-            fraction_mapped_reads = min(tot_nreads/float(n_metagenome_reads), 1.0) if ESTIMATE_UNK else 1.0
             unmapped_reads = max(n_metagenome_reads - tot_nreads, 0)
 
             outpred = [(taxstr, taxid,round(relab*100.0*fraction_mapped_reads,5)) for (taxstr, taxid),relab in cl2ab.items() if relab > 0.0]
 
             if outpred:
-                outf.write( "#estimated_reads_mapped_to_known_clades:{}\n".format(tot_nreads) )
+                outf.write( "#estimated_reads_mapped_to_known_clades:{}\n".format(round(tot_nreads)) )
                 outf.write( "\t".join( [    "#clade_name",
                                             "clade_taxid",
                                             "relative_abundance",
                                             "coverage",
                                             "estimated_number_of_reads_from_the_clade" ]) +"\n" )
                 if ESTIMATE_UNK:
-                    outf.write( "\t".join( [    "UNKNOWN",
+                    outf.write( "\t".join( [    "UNCLASSIFIED",
                                                 "-1",
                                                 str(round((1-fraction_mapped_reads)*100,5)),
                                                 "-",
-                                                str(unmapped_reads) ]) + "\n" )
+                                                str(round(unmapped_reads)) ]) + "\n" )
                                                 
                 for taxstr, taxid, relab in sorted(  outpred, reverse=True,
                                     key=lambda x:x[2]+(100.0*(8-(x[0].count("|"))))):
@@ -1161,9 +1646,9 @@ def main():
                                                 "relative_abundance",
                                                 "coverage",
                                                 "estimated_number_of_reads_from_the_clade" ]) +"\n" )
-                    outf.write( "unclassified\t-1\t100.0\t0\t0\n" )
+                    outf.write( "UNCLASSIFIED\t-1\t100.0\t0\t0\n" )
                 else:
-                    outf.write( "unclassified\t100.0\n" )
+                    outf.write( "UNCLASSIFIED\t100.0\n" )
             maybe_generate_biom_file(tree, pars, outpred)
 
         elif pars['t'] == 'clade_profiles':
@@ -1212,3 +1697,4 @@ if __name__ == '__main__':
     t0 = time.time()
     main()
     sys.stderr.write('Elapsed time to run MetaPhlAn: {} s\n'.format( (time.time()-t0) ) )
+
